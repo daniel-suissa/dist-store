@@ -37,7 +37,10 @@ import (
 	// timeout (if non leader)
 	// log keeping thread
 
-var connMap map[int]*NodeConnection
+const DIALINTERVAL = 5
+const QUEUESIZE = 10
+
+var connMap map[string]*NodeConnection
 var connMapLock sync.RWMutex
 
 var threadMap map[int]*chan Message
@@ -45,9 +48,10 @@ var threadMapLock sync.RWMutex
 
 type NodeConnection struct {
 	nodeAddr string
-	rw *bufio.ReadWriter
-	Queue chan Message
-	Mutex sync.RWMutex
+	reader *bufio.Reader
+	writer *bufio.Writer
+	Queue chan *Message
+	Lock sync.RWMutex
 }
 
 type Message struct {
@@ -62,8 +66,17 @@ type RaftMessage struct {
 	data interface{}
 }
 
-func dispatchMessages(nodeId int) {
-	nodeConn = connMap[nodeId]
+func getConn(addr string) {
+	if conn, found := connMap[addr]; found {
+		return conn
+	}
+	return nil
+}
+
+func insertConn(nodeConn *NodeConnection) {
+	connMap[nodeConn.nodeAddr] = nodeConn
+}
+func dispatchMessages(nodeConn *NodeConnection) {
 	queue = nodeConn.Queue
 	var message Message
 	for {
@@ -72,7 +85,8 @@ func dispatchMessages(nodeId int) {
 	}
 }
 
-func acceptMessages(nodeId int) {
+func acceptMessages(nodeConn *NodeConnection) {
+	//get Message and put in threads channels here
 
 }
 
@@ -80,32 +94,58 @@ func queueMessage(queue chan<- Message, message Message) {
 	queue <- message
 }
 
-func nodeConnInit(nodeAddr string) (*nodeConnection) {
-	rw, err := Open(nodeAddr) //open the connection and get a stream
-	if err != nil {
-		panic(fmt.Sprintf("Client: Failed to open connection to %v: %v",serverAddr,err))
-	}
-	
-	if err != nil {
-		panic(fmt.Sprintf("Could not write GOB data: %v",serverAddr,err))
+func nodeConnInit(nodeAddr, getStream func(string) (*bufio.Reader, *bufio.Writer ,error) ) bool {
+	var conn NodeConnection
+	connMapLock.Lock()
+	defer connMapLock.Unlock()
+	conn = getConn(nodeAddr)
+	defer connMap.Unlock()
+	if conn != nil {
+		 return true
 	}
 
+	reader, writer, err := getStream(nodeAddr) //open the connection and get a stream
+	if err != nil {
+		return false
+	} else {
+		createConn(serverAddr, reader, writer)
+		return true
+	}
+}
+func createConn(addr string, reader *bufio.Reader, writer *bufio.Writer) *NodeConnection {
 	nodeConn := NodeConnection{}
-	nodeConn.rw = rw
+	nodeConn.reader = reader
+	nodeConn.writer = writer
 	nodeConn.serverAddr = serverAddr
+	nodeConn.Queue = make(chan *Message, QUEUESIZE)
+	insertConn(nodeConn)
+	go dispatchMessages(nodeConn)
+	go acceptMessages(nodeConn)
 	return &nodeConn
 }
 
-func Open(addr string) (*bufio.ReadWriter, error) {
+func DialNode(nodeAddr string) bool {
+	timer := time.NewTimer(DIALINTERVAL * time.Second)
+	for {
+		if nodeConnInit(nodeAddr, Open) {
+			return true
+		}
+		<-timer.C
+		
+	}
+	return false
+}
+
+func Open(addr string) (*bufio.Reader, *bufio.Writer ,error) {
 	log.Println("Dial " + addr)
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
-		return nil, fmt.Errorf("%#v: Dialing "+addr+" failed", err)
+		return nil, nil, fmt.Errorf("%#v: Dialing "+addr+" failed", err)
 	}
-	return bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn)), nil
+	return (bufio.NewReader(conn), bufio.NewWriter(conn), nil)
 }
 
-func (nodeConn *NodeConnection) sendMessage(message Message) (error) {
+func (nodeConn *NodeConnection) sendMessage(message *Message) (error) {
 	
 	log.Printf("Sending: \n%#v\n", message)
 	
@@ -135,7 +175,10 @@ func listen(port string) error {
 			log.Println("Failed accepting a connection request:", err)
 			continue
 		}
-		go handleCmd(conn)
+		nodeConnInit(conn.RemoteAddr().String, func (s string) (*bufio.Reader, *bufio.Writer ,error) {
+				return (bufio.NewReader(conn), bufio.NewWriter(conn), nil)
+			})
+
 	}
 }
 func setup(args []string) {
@@ -155,9 +198,9 @@ func setup(args []string) {
 			addresses := strings.Split(arg, ",")
 			for addr := range addresses {
 				if addr[0] == ":" {
-					connMap[nodeId] = nodeConnInit(defaultHostname + arg)
+					connMap[nodeId] = DialNode(defaultHostname + arg)
 				} else {
-					connMap[nodeId] = nodeConnInit(arg)
+					connMap[nodeId] = DialNode(arg)
 				}
 				cmd = ""
 			}
