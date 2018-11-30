@@ -38,6 +38,10 @@ import (
 	// log keeping thread
 
 var connMap map[int]*NodeConnection
+var connMapLock sync.RWMutex
+
+var threadMap map[int]*chan Message
+var threadMapLock sync.RWMutex
 
 type NodeConnection struct {
 	nodeAddr string
