@@ -4,13 +4,12 @@ import (
 	"bufio"
 	"log"
 	"net"
-	"io"
 	"encoding/gob"
 	"os"
 	"time"
 	"sync"
 	"fmt"
-	"sync/atomic"
+	"strings"
 )
 
 //connMap is protected by RWMutex (one or more connection can be a front end)
@@ -46,6 +45,8 @@ var connMapLock sync.RWMutex
 var threadMap map[int]*chan Message
 var threadMapLock sync.RWMutex
 
+var tid int32
+
 type NodeConnection struct {
 	nodeAddr string
 	reader *bufio.Reader
@@ -55,7 +56,7 @@ type NodeConnection struct {
 }
 
 type Message struct {
-	Tid int
+	Tid int32
 	Type string
 	ConnId int
 	Request interface{}
@@ -66,7 +67,7 @@ type RaftMessage struct {
 	data interface{}
 }
 
-func getConn(addr string) {
+func getConn(addr string) *NodeConnection {
 	if conn, found := connMap[addr]; found {
 		return conn
 	}
@@ -77,29 +78,36 @@ func insertConn(nodeConn *NodeConnection) {
 	connMap[nodeConn.nodeAddr] = nodeConn
 }
 func dispatchMessages(nodeConn *NodeConnection) {
-	queue = nodeConn.Queue
-	var message Message
+	queue := nodeConn.Queue
+	var message *Message
 	for {
-		message <- queue
+		message = <- queue
 		nodeConn.sendMessage(message)
 	}
 }
 
 func acceptMessages(nodeConn *NodeConnection) {
 	//get Message and put in threads channels here
-
+	var message Message
+	for {
+		dec := gob.NewDecoder(nodeConn.reader)
+		err := dec.Decode(&message)
+		if err != nil {
+			log.Println("Error Decoding: ", err)
+		}
+	}
+	
 }
 
-func queueMessage(queue chan<- Message, message Message) {
+func queueMessage(queue chan<- *Message, message *Message) {
 	queue <- message
 }
 
-func nodeConnInit(nodeAddr, getStream func(string) (*bufio.Reader, *bufio.Writer ,error) ) bool {
-	var conn NodeConnection
+func nodeConnInit(nodeAddr string, getStream func(string) (*bufio.Reader, *bufio.Writer ,error) ) bool {
+	var conn *NodeConnection
 	connMapLock.Lock()
 	defer connMapLock.Unlock()
 	conn = getConn(nodeAddr)
-	defer connMap.Unlock()
 	if conn != nil {
 		 return true
 	}
@@ -108,7 +116,7 @@ func nodeConnInit(nodeAddr, getStream func(string) (*bufio.Reader, *bufio.Writer
 	if err != nil {
 		return false
 	} else {
-		createConn(serverAddr, reader, writer)
+		createConn(nodeAddr, reader, writer)
 		return true
 	}
 }
@@ -116,11 +124,11 @@ func createConn(addr string, reader *bufio.Reader, writer *bufio.Writer) *NodeCo
 	nodeConn := NodeConnection{}
 	nodeConn.reader = reader
 	nodeConn.writer = writer
-	nodeConn.serverAddr = serverAddr
+	nodeConn.nodeAddr = addr
 	nodeConn.Queue = make(chan *Message, QUEUESIZE)
-	insertConn(nodeConn)
-	go dispatchMessages(nodeConn)
-	go acceptMessages(nodeConn)
+	insertConn(&nodeConn)
+	go dispatchMessages(&nodeConn)
+	go acceptMessages(&nodeConn)
 	return &nodeConn
 }
 
@@ -136,25 +144,25 @@ func DialNode(nodeAddr string) bool {
 	return false
 }
 
-func Open(addr string) (*bufio.Reader, *bufio.Writer ,error) {
+func Open(addr string) (*bufio.Reader, *bufio.Writer , error) {
 	log.Println("Dial " + addr)
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%#v: Dialing "+addr+" failed", err)
 	}
-	return (bufio.NewReader(conn), bufio.NewWriter(conn), nil)
+	return bufio.NewReader(conn), bufio.NewWriter(conn), nil
 }
 
 func (nodeConn *NodeConnection) sendMessage(message *Message) (error) {
 	
 	log.Printf("Sending: \n%#v\n", message)
 	
-	enc := gob.NewEncoder(nodeConn.rw)
-	err := enc.Encode(message) //marshall the request
+	enc := gob.NewEncoder(nodeConn.writer)
+	err := enc.Encode(*message) //marshall the request
 	if err != nil {
-		return fmt.Errorf("%#v: Encode failed for struct: %#v", err, request)
+		return fmt.Errorf("%#v: Encode failed for struct: %#v", err, *message)
 	}
-	err = nodeConn.rw.Flush()
+	err = nodeConn.writer.Flush()
 	if err != nil {
 		return fmt.Errorf("%#v: Flush failed.",err)
 	}
@@ -175,43 +183,56 @@ func listen(port string) error {
 			log.Println("Failed accepting a connection request:", err)
 			continue
 		}
-		nodeConnInit(conn.RemoteAddr().String, func (s string) (*bufio.Reader, *bufio.Writer ,error) {
-				return (bufio.NewReader(conn), bufio.NewWriter(conn), nil)
+		nodeConnInit(conn.RemoteAddr().String(), func (s string) (*bufio.Reader, *bufio.Writer ,error) {
+				return bufio.NewReader(conn), bufio.NewWriter(conn), nil
 			})
 
 	}
 }
+
+func messageThread(tid int32) {
+	types := []string{"A", "B", "C", "D"}
+	//responseCh := make(chan *Message)
+	var message Message
+	for _, conn := range connMap {
+		for _,t := range types{
+			message = Message{Tid: tid, Type: t}
+			queueMessage(conn.Queue, &message)
+		}
+	}
+}
+
 func setup(args []string) {
 	port := ":61000"
     defaultHostname := "127.0.0.1"
     var arg string
 	i := 0
-	nodeId := 0
-	expectedArg = "" //listen or backend
+	expectedArg := "" //listen or backend
 	for i < len(args) {
 		arg = args[i]
 		if arg == "--backend" {
 			expectedArg = "backend"
 		} else if arg == "--listen" && i + 1 < len(args) {
 			expectedArg = "backend"
-		} else if cmd == "backend" {
+		} else if expectedArg == "backend" {
 			addresses := strings.Split(arg, ",")
-			for addr := range addresses {
-				if addr[0] == ":" {
-					connMap[nodeId] = DialNode(defaultHostname + arg)
+			for _, addr := range addresses {
+				if addr[0] == ':' {
+					go DialNode(defaultHostname + arg)
 				} else {
-					connMap[nodeId] = DialNode(arg)
+					go DialNode(arg)
 				}
-				cmd = ""
+				expectedArg = ""
 			}
-		} else if cmd == "listen" {
+		} else if expectedArg == "listen" {
 			port = ":" + args[i+1]
-			cmd = ""
+			expectedArg = ""
 		} else {
 			panic("command line error")	
 		}
 		i++
 	}
+	go listen(port)
 }
 
 func main() {
