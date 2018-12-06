@@ -220,13 +220,24 @@ func ExecuteRaftMessage(message *Message) {
 }
 
 func clientMessageHandler(nodeConn *NodeConnection, message *Message) {
+	//TODO: if I am a candidate, wait to get a signal from the raft channel
+
 	//TODO: if I am not the leader, respond with the leader's address
 
 	log.Printf("Got Client Message: %#v\n", *message)
+	
+
 	//respond
 	response := Message{Tid: message.Tid, PrimaryType: "response", Request: message.Request}
 	queueMessage(nodeConn.Queue, &response)
 }
+
+
+//keep a state and an election term
+//thread for timing out on the leader, dies when the time times out and goes to elections
+//thread for going to elections - handling vote requests and counting
+//thread for sending leader pings to everyone
+
 //Business Logic
 
 //Connection handlers
@@ -243,27 +254,25 @@ func cleanConn(nodeConn *NodeConnection) {
 }
 
 
-func nodeConnInit(nodeAddr string, getStream func(string) (*bufio.Reader, *bufio.Writer ,error)) bool {
+func nodeConnInit(conn net.Conn) bool {
 	//create connection if it doesnt exist
 	//false -> failed to connect
 	//true -> connection exists or successful
 
-	var conn *NodeConnection
+	var nodeConn *NodeConnection
 	connMapLock.Lock()
 	defer connMapLock.Unlock()
-	conn = getConn(nodeAddr)
-	if conn != nil {
+	nodeAddr := conn.RemoteAddr().String()
+	nodeConn = getConn(nodeAddr)
+	if nodeConn != nil {
 		 return true
 	}
-	reader, writer, err := getStream(nodeAddr) //open the connection and get a stream
-	if err != nil {
-		return false
-	} else {
-		createConn(nodeAddr, reader, writer)
-		log.Println("Connected to " + nodeAddr)
-		return true
-	}
+	reader, writer := bufio.NewReader(conn), bufio.NewWriter(conn)
+	createConn(nodeAddr, reader, writer)
+	log.Println("Connected to " + nodeAddr)
+	return true
 }
+
 func createConn(addr string, reader *bufio.Reader, writer *bufio.Writer) *NodeConnection {
 	nodeConn := NodeConnection{}
 	nodeConn.reader = reader
@@ -280,24 +289,24 @@ func DialNode(nodeAddr string) {
 	// keep trying to connect forever (serve as ping-ack as well)
 	timer := time.NewTimer(DIALINTERVAL * time.Second)
 	for {
-		if nodeConnInit(nodeAddr, Open) {
+		conn, err := Open(nodeAddr)
+		if err == nil && nodeConnInit(conn) {
 			return
 		} else {
-			//TODO: put a kill message in channel
-			//delete the connection
+			// TODO: put a kill message in channel
+			// delete the connection
 		}
-		<-timer.C
-		
+		<-timer.C	
 	}
 }
 
-func Open(addr string) (*bufio.Reader, *bufio.Writer , error) {
+func Open(addr string) (net.Conn, error) {
 	log.Println("Dialing " + addr + "..")
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
-		return nil, nil, fmt.Errorf("%#v: Dialing "+addr+" failed", err)
+		return nil, fmt.Errorf("%#v: Dialing "+addr+" failed", err)
 	}
-	return bufio.NewReader(conn), bufio.NewWriter(conn), nil
+	return conn, nil
 }
 
 func listen(port string) error {
@@ -315,9 +324,7 @@ func listen(port string) error {
 		}
 
 		log.Printf("%s trying to connect\n", conn.RemoteAddr().String())
-		nodeConnInit(conn.RemoteAddr().String(), func (s string) (*bufio.Reader, *bufio.Writer ,error) {
-				return bufio.NewReader(conn), bufio.NewWriter(conn), nil
-			})
+		nodeConnInit(conn)
 
 	}
 }
@@ -384,7 +391,7 @@ func main() {
 	wg.Add(1)
 	setup(args)
 	time.Sleep(5 * time.Second)
-	go messageThread()
+	//go messageThread()
 	wg.Wait()
 
 }
