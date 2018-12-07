@@ -49,7 +49,6 @@ const LOGSIZE = 1000
 const LEADERTIMEOUT = 3
 const RAFTQUEUESIZE = 1000
 
-type Message infra.Message
 
 type Raft struct {
 	State int //0: follower, 1: candidate, 2: leader
@@ -61,7 +60,9 @@ type Raft struct {
 }
 
 func initRaft() Raft {
-	return Raft{State: 0, Term: 0, MsgQueue: make(chan *infra.Message, RAFTQUEUESIZE)}
+	raft := Raft{State: 0, Term: 0, MsgQueue: make(chan *infra.Message, RAFTQUEUESIZE)}
+	go raft.msgHandler()
+	return raft
 }
 
 func (raft *Raft) getState() int {
@@ -103,10 +104,25 @@ func (raft *Raft) leaderTimer () {
 	}
 }
 func (raft *Raft) leaderPinger() {
-
+	print("H")
 }
 
-func (raft *Raft) executeRaftMessage(message *Message) {
+func (raft *Raft) msgHandler() {
+	var message *infra.Message
+	for {
+		select {
+			case message = <-raft.MsgQueue:
+				switch message.PrimaryType {
+				case "raft":
+					switch message.SecType {
+					case "id":
+
+					}
+				}
+		}
+	}
+}
+func (raft *Raft) executeRaftMessage(message *infra.Message) {
 	log.Println("H")
 }
 
@@ -132,9 +148,10 @@ func (raft *Raft) clientMessageHandler() {
 
 //Business Logic
 
-func parseCmdArgs(args []string) (string, []string){
+func parseCmdArgs(args []string) (string, []string, string){
 	port := ":61000"
 	var backendAddrs []string
+	var id string
     defaultHostname := "127.0.0.1"
     var arg string
 	i := 0
@@ -145,6 +162,8 @@ func parseCmdArgs(args []string) (string, []string){
 			expectedArg = "backend"
 		} else if arg == "--listen" && i + 1 < len(args) {
 			expectedArg = "listen"
+		} else if arg == "--id" { 
+			expectedArg = "id"
 		} else if expectedArg == "backend" {
 			addresses := strings.Split(arg, ",")
 			fmt.Println(addresses)
@@ -160,12 +179,14 @@ func parseCmdArgs(args []string) (string, []string){
 		} else if expectedArg == "listen" {
 			port = ":" + arg
 			expectedArg = ""
+		} else if expectedArg == "id" {
+			id = arg 
 		} else {
 			panic("command line error")	
 		}
 		i++
 	}
-	return port, backendAddrs
+	return port, backendAddrs, id
 }
 
 func main() {
@@ -173,9 +194,9 @@ func main() {
 	args := os.Args[1:]
 	wg := sync.WaitGroup{}
 	wg.Add(1)
-	port, backendAddrs := parseCmdArgs(args)
+	port, backendAddrs, id := parseCmdArgs(args)
 	raft := initRaft()
-	infra.StartInfra(port, backendAddrs, raft.MsgQueue)
+	infra.StartInfra(port, backendAddrs, id, raft.MsgQueue)
 	//go messageThread()
 	wg.Wait()
 }
