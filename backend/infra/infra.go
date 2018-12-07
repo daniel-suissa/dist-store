@@ -17,7 +17,7 @@ const DIALINTERVAL = 5
 const QUEUESIZE = 10
 const RESPONSESSIZE = 10
 
-var connMap map[string]*NodeConnection
+var connMap map[int]*NodeConnection
 var connMapLock sync.RWMutex
 
 var threadMap map[int32]*Thread
@@ -47,7 +47,7 @@ type Message struct {
 	Request interface{}
 }
 
-type Thread struct{
+type Thread struct {
 	Tid int32
 	KillChan chan int
 	Responses chan *Message
@@ -65,8 +65,8 @@ func MakeThread() *Thread {
 	return &thread
 }
 
-func getConn(addr string) *NodeConnection {
-	if conn, found := connMap[addr]; found {
+func getConn(id int) *NodeConnection {
+	if conn, found := connMap[id]; found {
 		return conn
 	}
 	return nil
@@ -143,8 +143,9 @@ func acceptMessages(nodeConn *NodeConnection) {
         			}
 				} else {
 					//message logic here
-					thread = getThread(message.Tid)
+					
 					if message.PrimaryType == "response" {
+						thread = getThread(message.Tid)
 						thread.Responses <- &message
 						log.Println(message)
 					} else if message.PrimaryType == "raft" || message.PrimaryType == "client" {
@@ -199,40 +200,49 @@ func cleanConn(nodeConn *NodeConnection) {
 	getThread(nodeConn.dispatchTheadId).KillChan <- 1
 	print("Sent kill message")
 	connMapLock.Lock()
-	delete(connMap, nodeConn.nodeAddr)
+	delete(connMap, nodeConn.Id)
 	connMapLock.Unlock()
-	//TODO: remove node from the map
 	go DialNode(nodeConn.nodeAddr)
 }
 
 
 func nodeConnInit(conn net.Conn) bool {
 	//create connection if it doesnt exist
-	//false -> failed to connect
-	//true -> connection exists or successful
 
-	var nodeConn *NodeConnection
-	connMapLock.Lock()
-	defer connMapLock.Unlock()
-	nodeAddr := conn.RemoteAddr().String()
-	nodeConn = getConn(nodeAddr)
-	if nodeConn != nil {
-		 return true
-	}
 	reader, writer := bufio.NewReader(conn), bufio.NewWriter(conn)
-	createConn(nodeAddr, reader, writer)
-	log.Println("Connected to " + nodeAddr)
+	nodeConn := createConn(conn, reader, writer)
+	if nodeConn != nil {
+		log.Println("New connction with " + nodeConn.nodeAddr)
+	}
+	
 	return true
 }
 
-func createConn(addr string, reader *bufio.Reader, writer *bufio.Writer) *NodeConnection {
+func createConn(conn net.Conn, reader *bufio.Reader, writer *bufio.Writer) *NodeConnection {
 	nodeConn := NodeConnection{}
 	nodeConn.reader = reader
 	nodeConn.writer = writer
-	nodeConn.nodeAddr = addr
+	nodeConn.nodeAddr = conn.RemoteAddr().String()
 	nodeConn.Queue = make(chan *Message, QUEUESIZE)
-	QueueMessage(nodeConn.Queue, &Message{Tid: -1, PrimaryType: "raft", SecType: "id", Request: id})
-	connMap[nodeConn.nodeAddr] = &nodeConn
+	
+	//send and accept the nodeId
+	nodeConn.sendMessage(&Message{Tid: -1, PrimaryType: "id", Request: id})
+	var message Message
+	dec := gob.NewDecoder(nodeConn.reader)
+	err := dec.Decode(&message)
+	if err != nil || message.PrimaryType != "id" {
+		return nil
+	}
+	nodeId, ok := message.Request.(int)
+	if !ok {
+		return nil
+	}
+	connMapLock.Lock()
+	defer connMapLock.Unlock()
+	if _, ok := connMap[nodeId]; ok {
+		return connMap[nodeId]
+	}
+	connMap[nodeId] = &nodeConn
 	go dispatchMessages(&nodeConn)
 	go acceptMessages(&nodeConn)
 	return &nodeConn
@@ -298,7 +308,7 @@ func messageThread() {
 }
 
 func StartInfra(port string, backends []string, idstr string, defaultMsgChan chan *Message) {
-	connMap = make(map[string]*NodeConnection)
+	connMap = make(map[int]*NodeConnection)
 	threadMap = make(map[int32]*Thread)
 	msgChan = defaultMsgChan
 	if i, err := strconv.Atoi(idstr); err == nil {
