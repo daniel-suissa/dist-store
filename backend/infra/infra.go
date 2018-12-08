@@ -28,6 +28,8 @@ var msgChan chan *Message // where all messages that are not responses go
 var id int
 var tid int32
 
+var clusterSize int
+
 type NodeConnection struct {
 	nodeAddr string
 	reader *bufio.Reader
@@ -37,13 +39,17 @@ type NodeConnection struct {
 	listenThreadId int32
 	dispatchTheadId int32
 	Id int
+	Encoder *gob.Encoder
+	Decoder *gob.Decoder
 }
+
 
 type Message struct {
 	Tid int32
 	PrimaryType string
 	SecType string
 	NodeAddr string
+	NodeId int
 	Request interface{}
 }
 
@@ -54,7 +60,24 @@ type Thread struct {
 }
 
 
+type RaftMessage struct {
+	Term int
+	Data interface{}
+}
 
+func GetId() int {
+	return id
+}
+
+func GetClusterSize() int {
+	return clusterSize
+}
+func GetConnMap() map[int]*NodeConnection{
+	connMapLock.RLock()
+	connMapCopy := connMap
+	connMapLock.RUnlock()
+	return connMapCopy
+}
 //Thread Communication Infra
 func MakeThread() *Thread {
 	thread := Thread{}
@@ -65,7 +88,8 @@ func MakeThread() *Thread {
 	return &thread
 }
 
-func getConn(id int) *NodeConnection {
+func GetConn(id int) *NodeConnection {
+	log.Printf("INFRA: getting conn %d from map %#v", id, connMap)
 	if conn, found := connMap[id]; found {
 		return conn
 	}
@@ -97,11 +121,11 @@ func getThread(id int32) *Thread {
 
 func dispatchMessages(nodeConn *NodeConnection) {
 	log.Printf("starting dispatch thread for node %s\n", nodeConn.nodeAddr)
-	me := Thread{Tid: atomic.AddInt32(&tid, 1), KillChan: make(chan int, 1), Responses: nil}
+	me := MakeThread()
 	nodeConn.dispatchTheadId = me.Tid
-	insertThread(&me)
 	queue := nodeConn.Queue
 	var message *Message
+	var err error
 	for {
 		select {
 	        case <- me.KillChan:
@@ -111,7 +135,12 @@ func dispatchMessages(nodeConn *NodeConnection) {
 	            return
 	        case message = <- queue:
 	        	//if fails, put a failure in accepqueue
-	        	nodeConn.sendMessage(message)	
+	        	err = nodeConn.sendMessage(message)	
+	        	if err != nil {
+	        		log.Printf("Could not send message %#v, sending failure instead: %#v", *message, err)
+	        		failureResponse := Message{Tid: message.Tid, PrimaryType: "response", SecType: "failure"}
+	        		QueueMessage(nodeConn.Queue, &failureResponse)
+	        	}
         }
 	}
 }
@@ -119,13 +148,11 @@ func dispatchMessages(nodeConn *NodeConnection) {
 func acceptMessages(nodeConn *NodeConnection) {
 	log.Printf("starting accept thread for node %s\n", nodeConn.nodeAddr)
 	//get Message and put in threads channels here
-	me := Thread{Tid: atomic.AddInt32(&tid, 1), KillChan: make(chan int, 1), Responses: nil}
+	me := MakeThread()
 	nodeConn.listenThreadId = me.Tid
-	insertThread(&me)
 	var message Message
 	var thread *Thread
 	for {
-		dec := gob.NewDecoder(nodeConn.reader)
 		select {
 			case <- me.KillChan:
 				log.Printf("Node %s is gone, stopping listening \n", nodeConn.nodeAddr)
@@ -133,6 +160,7 @@ func acceptMessages(nodeConn *NodeConnection) {
 	        	removeThread(me.Tid)
 	            return
 	        default:
+	        	dec := nodeConn.Decoder
 	        	err := dec.Decode(&message)
 	        	if err != nil {
 	        		if err == io.EOF {
@@ -142,14 +170,22 @@ func acceptMessages(nodeConn *NodeConnection) {
         				log.Println("Error Decoding: ", err)
         			}
 				} else {
+					err = nodeConn.writer.Flush()
+					if err != nil {
+						panic("Flush error") 
+					}
 					//message logic here
-					
+					message.NodeId = nodeConn.Id
 					if message.PrimaryType == "response" {
 						thread = getThread(message.Tid)
+						if thread == nil {
+							log.Printf("non existing thread destination for message %#v", message)
+						}
 						thread.Responses <- &message
 						log.Println(message)
 					} else if message.PrimaryType == "raft" || message.PrimaryType == "client" {
 						message.NodeAddr = nodeConn.nodeAddr
+						message.NodeId = nodeConn.Id
 						msgChan <- &message
 					} else if  message.PrimaryType == "id"{
 						nodeId, ok := message.Request.(int)
@@ -173,7 +209,8 @@ func (nodeConn *NodeConnection) sendMessage(message *Message) (error) {
 	
 	log.Printf("Sending: \n%#v\n", message)
 	
-	enc := gob.NewEncoder(nodeConn.writer)
+	//enc := gob.NewEncoder(nodeConn.writer)
+	enc := nodeConn.Encoder
 	err := enc.Encode(*message) //marshall the request
 	if err != nil {
 		//TODO: if error means the thread is gone, kill it
@@ -192,6 +229,14 @@ func QueueMessage(queue chan<- *Message, message *Message) {
 	queue <- message
 }
 
+func QueueMessageForAll(message *Message) {
+	connMapLock.RLock()
+	defer connMapLock.RUnlock()
+	for _, nodeConn := range(connMap) {
+		nodeConn.Queue <- message
+	}
+	
+}
 
 //Connection handlers
 
@@ -224,25 +269,37 @@ func createConn(conn net.Conn, reader *bufio.Reader, writer *bufio.Writer) *Node
 	nodeConn.writer = writer
 	nodeConn.nodeAddr = conn.RemoteAddr().String()
 	nodeConn.Queue = make(chan *Message, QUEUESIZE)
-	
+	var err error
 	//send and accept the nodeId
-	nodeConn.sendMessage(&Message{Tid: -1, PrimaryType: "id", Request: id})
+	nodeConn.Encoder = gob.NewEncoder(nodeConn.writer)
+	nodeConn.Decoder = gob.NewDecoder(nodeConn.reader)
+	err = nodeConn.sendMessage(&Message{Tid: -1, PrimaryType: "id", Request: id})
+	if err != nil {
+		log.Printf("Error sending message: %#v", err)
+	}
 	var message Message
-	dec := gob.NewDecoder(nodeConn.reader)
-	err := dec.Decode(&message)
-	if err != nil || message.PrimaryType != "id" {
+	dec := nodeConn.Decoder
+	err = dec.Decode(&message)
+	if err != nil {
+		log.Printf("error decoding id message: %#v", err)
+		return nil
+	} else if message.PrimaryType != "id" {
+		log.Printf("error decoding id: got a different message")
 		return nil
 	}
 	nodeId, ok := message.Request.(int)
 	if !ok {
+		log.Printf("error converting id")
 		return nil
 	}
+	log.Printf("Checking if connection already exists...Id: %d", nodeId)
 	connMapLock.Lock()
 	defer connMapLock.Unlock()
 	if _, ok := connMap[nodeId]; ok {
 		return connMap[nodeId]
 	}
 	connMap[nodeId] = &nodeConn
+	nodeConn.Id = nodeId
 	go dispatchMessages(&nodeConn)
 	go acceptMessages(&nodeConn)
 	return &nodeConn
@@ -308,8 +365,10 @@ func messageThread() {
 }
 
 func StartInfra(port string, backends []string, idstr string, defaultMsgChan chan *Message) {
+	gob.Register(RaftMessage{})
 	connMap = make(map[int]*NodeConnection)
 	threadMap = make(map[int32]*Thread)
+	clusterSize = len(backends) + 1
 	msgChan = defaultMsgChan
 	if i, err := strconv.Atoi(idstr); err == nil {
     	id = i
