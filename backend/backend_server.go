@@ -47,14 +47,18 @@ type Raft struct {
 	State int //0: follower, 1: candidate, 2: leader
 	StateLock sync.Mutex
 	Term int
-	TermLock sync.Mutex
+	TermLock sync.Mutex // always lock this before the 
 	MsgLog []*infra.Message
 	MsgQueue chan *infra.Message
 	PingChan chan *infra.RaftMessage
-	HigherLeaderNotify chan int
 	LeaderId int
+	ElectionsKiller chan int
+
+	//if leader
 	LeaderTimeout time.Duration
 	ElectionTimeout time.Duration
+	LeaderPingerKiller chan int
+
 }
 
 func initRaft() Raft {
@@ -63,7 +67,6 @@ func initRaft() Raft {
 	raft.LeaderTimeout = timeout
 	timeout = time.Duration(rand.Intn(150) + 150)
 	raft.ElectionTimeout = timeout
-	raft.HigherLeaderNotify = make(chan int, 1)
 	raft.Term = 0
 	go raft.msgHandler()
 	go raft.leaderTimer()
@@ -163,7 +166,8 @@ func (raft *Raft) toElection() {
 						}
 					}
 				}
-			case <- raft.HigherLeaderNotify:
+			case <- raft.ElectionsKiller: 
+				//whoever did this is in charge of changing the state
 				return
 			case <-timer.C:
 				go raft.toElection()
@@ -202,7 +206,8 @@ func (raft *Raft) leaderPinger() {
 	var ping infra.RaftMessage
 	for {
 		select {
-			case <-raft.HigherLeaderNotify:
+			case <-raft.LeaderPingerKiller:
+				//whoever did this will change the states
 				return
 			default:
 				ping = infra.RaftMessage{Term: raft.Term, Data: "ping"}
@@ -216,14 +221,24 @@ func (raft *Raft) leaderPinger() {
 func (raft *Raft) leaderPingHandler(raftMsg *infra.RaftMessage) {
 	//if got ping of higher term an am leader / in election - kill channels and become follower
 	raft.TermLock.Lock()
-	defer raft.TermLock.Unlock()
-	if raftMsg.Term > raft.Term { //send pings of the same term to the leaderPinger
-		raft.HigherLeaderNotify <- 1
+	raft.StateLock.Lock()
+	
+	if raftMsg.Term > raft.Term { 
+		if raft.State == 1 { //if candidate, kill elections
+			raft.ElectionsKiller <- 1
+		} else if raft.State == 2 { // if leader, relinquish
+			raft.LeaderPingerKiller <- 1		}
+
 		raft.Term = raftMsg.Term
-		raft.becomeFollower()
+		raft.TermLock.Unlock()
+		raft.StateLock.Unlock()
+		raft.becomeFollower() //will only be able to start after StateLock is released
+		return
 	} else if raftMsg.Term == raft.Term{
 		raft.PingChan <- raftMsg
 	}
+	raft.TermLock.Unlock()
+	raft.StateLock.Unlock()
 	//if got ping of a lower term, drop it
 }
 
@@ -258,16 +273,49 @@ func (raft *Raft) msgHandler() {
 					case "voteRequest":
 						go raft.vote(message)
 					} 
+				case "client":
+					go raft.clientMessageHandler(message)
 				}
 		}
 	}
 }
 
+func (raft *Raft) clientMessageHandler(message *infra.Message) {
+	//REMEMBER: if at any point node is not a leader anymore, stop and reply with the leader's address 
+	clientMessage := message.Request.(infra.ClientMessage)
+	log.Println(clientMessage)
+	//first spin if I am a candidate
+	raft.StateLock.Lock()
+	if raft.State == 1 {
+		raft.StateLock.Unlock()
+		for {
+			raft.StateLock.Lock()
+			if raft.State != 1 {
+				break
+			}
+			raft.StateLock.Unlock()
+		}
+		raft.StateLock.Unlock()
+	}
+
+	//if I am not the leader, tell the client who the leader is
+	
+	if raft.State == 2 {
+		//respond with the leader's address
+	} else  {
+		//spin until I'm in a different state
+	}
+	
+}
 func (raft *Raft) appendEntryHandler(entry *infra.RaftMessage) {
 	//TODO: if I am a candidate, wait to get a signal from the raft channel
 
 	//TODO: if I am not the leader, respond with the leader's address
 
+	//TODO: if I am the leader:
+		//send append to everyone else
+		//wait for their responses, if got a qourom, send commit
+		//wait for their responses
 	message := <- raft.MsgQueue
 	log.Printf("Got Client Message: %#v\n", *message)
 	

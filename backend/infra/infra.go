@@ -65,6 +65,11 @@ type RaftMessage struct {
 	Data interface{}
 }
 
+type ClientMessage struct {
+	Term int
+	Data interface{}
+}
+
 func GetId() int {
 	return id
 }
@@ -205,11 +210,7 @@ func acceptMessages(nodeConn *NodeConnection) {
 	
 }
 
-func (nodeConn *NodeConnection) sendMessage(message *Message) (error) {
-	
-	log.Printf("Sending: \n%#v\n", message)
-	
-	//enc := gob.NewEncoder(nodeConn.writer)
+func (nodeConn *NodeConnection) sendMessage(message *Message) (error) {	
 	enc := nodeConn.Encoder
 	err := enc.Encode(*message) //marshall the request
 	if err != nil {
@@ -220,7 +221,6 @@ func (nodeConn *NodeConnection) sendMessage(message *Message) (error) {
 	if err != nil {
 		return fmt.Errorf("%#v: Flush failed.",err)
 	}
-	log.Println("Message Sent!")
 	return nil
 }
 
@@ -366,6 +366,7 @@ func messageThread() {
 
 func StartInfra(port string, backends []string, idstr string, defaultMsgChan chan *Message) {
 	gob.Register(RaftMessage{})
+	gob.Register(ClientMessage{})
 	connMap = make(map[int]*NodeConnection)
 	threadMap = make(map[int32]*Thread)
 	clusterSize = len(backends) + 1
