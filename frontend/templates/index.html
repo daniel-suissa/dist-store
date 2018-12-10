@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+<head>
+	<title>Reading List</title>
+	<link rel="stylesheet" href="style.css">
+</head>
+<body>
+	<h2>Reading List</h2>
+<table style="table-layout:fixed; overflow: hidden;">
+  <tr>
+    <th style="width: 100px">Title</th>
+    <th style="width: 300px">Author</th>
+    <th></th>
+    <th></th>
+  </tr>
+   {{range .Books}}
+		<tr>
+		    <td style="text-align: center;">{{.Title}}</td>
+		    <td style="text-align: center;">{{.Author}}</td>
+		    <td><a href="/edit/{{.Id}}">Update</a></td>
+		    <td>
+		    	<form action="/delete" method="post">
+		    	<input type="hidden" name="id" value="{{.Id}}" />
+	    		<input type="submit" value="Delete">
+				</form>
+		</tr>
+	{{end}}
+</table>
+<a href="/add">Add a Book</a>
+</body>
+</html>

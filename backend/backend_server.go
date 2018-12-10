@@ -10,33 +10,43 @@ import (
 	"strings"
 	"math/rand"
 )
-//TODO: remove threads from the map when they die
-//TODO: remove connections from the map when they die
-//CONSIDER - have two connections for each node
 
-//connMap is protected by RWMutex (one or more connection can be a front end)
-//threadMap maps thread ids to Channels so they can accept messages
+/*
+Messages that a node can send:
+	- Append Entry: 
+		- PrimaryType: "raft", 
+		- SecType: "appendEntry", 
+		- Request: raftMessage with Data: AppendMessage
+	- Vote Request:
+		- PrimaryType: "raft", 
+		- SecType: "voteRequest", 
+		- Request: raftMessage
+	- Log Recovery:
+		- PrimaryType: "raft", 
+		- SecType: "logRecovery", 
+		- Request: raftMessage with Data: whole msgLog 
 
-// every node starts dialing to all other nodes - it doesn't care when they fail
-	// checks if remote Addr is in the connMap
-	// it saves a map of remoteAddr -> conn
+Messages that a node can recieve as responses:
+	- Vote
+		- PrimaryType: "response" (the arrival of the response is the message)
+	- Append Ok
+		- PrimaryType: "response"
+		- SecType: "appendOk"
+	- Inconsistent Log
+		- PrimaryType: "response"
+		- SecType: "inconsistentLog"
 
-// every node is listening on the tcp port
-	// every acceptance, it checks if the remoteAddr is in the connMap
-	// is saves the conn to the map
-
-// every time a connection is made, two threads start: 
-	// a messageDispatcher continuously sends message from its SendQueue
-	// a messageListener thread puts messsages in their threads channels (using threadMap)
-	//
-
-// when a task thread starts:
-	// its id and Message channels are inserted to the threadMap
-
-//(future) task threads can be:
-	// hearbeat (if leader)
-	// timeout (if non leader)
-	// log keeping thread
+Possible Responses to Frontends:
+	- Ok
+		- PrimaryType: "ok"
+		- Request: infra.ClientResponse
+	- Not Leader
+		- PrimaryType: leaderId
+		- Request: new leader id (int)
+	- Failure
+		- leader can't reach a qourom
+	- frontend may time out and try a different node, see frontend doc
+*/
 
 
 //Raft Logic 
@@ -44,14 +54,20 @@ const LOGSIZE = 1000
 const RAFTQUEUESIZE = 1000
 
 type Raft struct {
+	//lock should only be locked in this order: Term, State, Log
 	State int //0: follower, 1: candidate, 2: leader
 	StateLock sync.Mutex
 	Term int
-	TermLock sync.Mutex // always lock this before the 
-	MsgLog []*infra.Message
+	TermLock sync.Mutex
+	MsgLog []*infra.AppendMessage
+	LogNum int
+	LogNumLock sync.Mutex
+	LogConsistencyFlag bool // also controlled by the same mutex
+
 	MsgQueue chan *infra.Message
 	PingChan chan *infra.RaftMessage
 	LeaderId int
+	LeaderIdLock sync.Mutex
 	ElectionsKiller chan int
 
 	//if leader
@@ -68,6 +84,9 @@ func initRaft() Raft {
 	timeout = time.Duration(rand.Intn(150) + 150)
 	raft.ElectionTimeout = timeout
 	raft.Term = 0
+	raft.LogNum = 0
+	raft.ElectionsKiller = make(chan int, 1)
+	raft.LeaderPingerKiller = make(chan int, 1)
 	go raft.msgHandler()
 	go raft.leaderTimer()
 	return raft
@@ -99,9 +118,17 @@ func (raft *Raft) setTerm(newTerm int) {
 	raft.Term = newTerm
 }
 
-func (raft *Raft) raftManager() {
-	log.Println("")
+func (raft *Raft) getLeader() int {
+	raft.LeaderIdLock.Lock()
+	leader := raft.LeaderId
+	raft.LeaderIdLock.Unlock()
+	return leader
+}
 
+func (raft *Raft) setLeader(newLeader int) {
+	raft.LeaderIdLock.Lock()
+	raft.LeaderId = newLeader
+	raft.LeaderIdLock.Unlock()
 }
 
 func (raft *Raft) leaderTimer () {
@@ -126,8 +153,6 @@ func (raft *Raft) leaderTimer () {
 			return
 		}
 	}
-
-	
 }
 
 func (raft *Raft) toElection() {
@@ -195,34 +220,77 @@ func (raft *Raft) vote(message *infra.Message) {
 		log.Printf("RAFT: Voted")
 
 	} else {
-		log.Printf("RAFT: vote request has lower term than mine, dropping")
+		log.Printf("RAFT: Vote request has lower term than mine, dropping")
 	}
 }
 
 //should only get started once node becomes leader
-func (raft *Raft) leaderPinger() {
+func (raft *Raft) sendAppendEntries() {
 	me := infra.MakeThread()
 	timer := time.NewTimer(raft.LeaderTimeout / 3 * time.Millisecond)
-	var ping infra.RaftMessage
+	var votes int
+	neededVotes := infra.GetClusterSize() / 2 + 1
 	for {
+		FirstFor:
 		select {
 			case <-raft.LeaderPingerKiller:
 				//whoever did this will change the states
 				return
 			default:
-				ping = infra.RaftMessage{Term: raft.Term, Data: "ping"}
-				infra.QueueMessageForAll(&infra.Message{Tid: me.Tid, PrimaryType: "raft", SecType: "leaderPing", Request: ping})
+				raft.TermLock.Lock()
+				raft.LogNumLock.Lock()
+				var logEntry *infra.AppendMessage
+				if len(raft.MsgLog) > 0 {
+					logEntry = raft.MsgLog[len(raft.MsgLog)-1]
+				} else {
+					logEntry = &infra.AppendMessage{}
+				}
+				
+				raftMsg := infra.RaftMessage{Term: raft.Term, Data: logEntry}
+				infra.QueueMessageForAll(&infra.Message{Tid: me.Tid, PrimaryType: "raft", SecType: "appendEntry", Request: raftMsg})
+				raft.TermLock.Unlock()
+				raft.LogNumLock.Unlock()
+				
+				votes = 1 // vote for myself
+				for {
+					select {
+					case response := <-me.Responses:
+						if response.SecType == "inconsistentLog" {
+							go raft.sendLogForRecovery(response.NodeId)
+						} else if response.SecType == "appendOk" {
+							votes += 1
+							if votes >= neededVotes {
+								raft.LogNumLock.Lock()
+								raft.LogConsistencyFlag = true
+								raft.LogNumLock.Unlock()
+								break FirstFor
+							}
+						}
+					case <-timer.C:
+						timer = time.NewTimer(raft.LeaderTimeout / 3 * time.Millisecond)
+						break FirstFor
+					}
+
+				}
 				<-timer.C 
 				timer = time.NewTimer(raft.LeaderTimeout / 3 * time.Millisecond)
 		}
 	}
 }
 
-func (raft *Raft) leaderPingHandler(raftMsg *infra.RaftMessage) {
+func (raft *Raft) appendEntryHandler(message *infra.Message) {
+	//this function assumes that only the leader (or someone that should be the leader) 
+	//sends append messages
+
 	//if got ping of higher term an am leader / in election - kill channels and become follower
+	raftMsg, _ := message.Request.(infra.RaftMessage)
 	raft.TermLock.Lock()
 	raft.StateLock.Lock()
-	
+	raft.LogNumLock.Lock()
+	defer raft.TermLock.Unlock()
+	defer raft.StateLock.Unlock()
+	defer raft.LogNumLock.Unlock()
+
 	if raftMsg.Term > raft.Term { 
 		if raft.State == 1 { //if candidate, kill elections
 			raft.ElectionsKiller <- 1
@@ -230,16 +298,58 @@ func (raft *Raft) leaderPingHandler(raftMsg *infra.RaftMessage) {
 			raft.LeaderPingerKiller <- 1		}
 
 		raft.Term = raftMsg.Term
-		raft.TermLock.Unlock()
-		raft.StateLock.Unlock()
-		raft.becomeFollower() //will only be able to start after StateLock is released
+		raft.setLeader(message.NodeId)
+		go raft.becomeFollower() //will only be able to start after StateLock is released
 		return
-	} else if raftMsg.Term == raft.Term{
-		raft.PingChan <- raftMsg
+	} 
+	if raftMsg.Term == raft.Term {
+		
+		appndMsg, _ := raftMsg.Data.(infra.AppendMessage)
+		//if log entry is one larger than mine, append it and process
+		if appndMsg.LogNum == raft.LogNum + 1 {
+			raft.MsgLog = append(raft.MsgLog, &appndMsg) //apend to log
+			
+			//TODO: process
+
+			//respond
+			leaderConn := infra.GetConn(message.NodeId)
+			infra.QueueMessage(leaderConn.Queue, &infra.Message{
+					Tid: message.Tid,
+					PrimaryType: "response",
+					SecType: "appendOk"})
+
+		} else if appndMsg.LogNum > raft.LogNum {
+			//respond with recovery request
+			leaderConn := infra.GetConn(message.NodeId)
+			infra.QueueMessage(leaderConn.Queue, &infra.Message{
+					Tid: message.Tid,
+					PrimaryType: "response",
+					SecType: "inconsistentLog"})
+		} else if appndMsg.LogNum <= raft.LogNum {
+			//TODO: truncate the log
+		}
+		raft.PingChan <- &raftMsg // notify the leaderTimer that a message is in
 	}
-	raft.TermLock.Unlock()
-	raft.StateLock.Unlock()
+	
 	//if got ping of a lower term, drop it
+}
+func (raft *Raft) sendLogForRecovery(nodeId int) {
+	raft.TermLock.Lock()
+	raft.LogNumLock.Lock()
+	defer raft.TermLock.Unlock()
+	defer raft.LogNumLock.Unlock()
+	conn := infra.GetConn(nodeId)
+	msg := infra.Message{
+			PrimaryType: "raft", 
+			SecType: "logRecovery", 
+			Request: infra.RaftMessage{
+				Term: raft.Term,
+				Data: raft.MsgLog}}
+	infra.QueueMessage(conn.Queue, &msg)
+}
+func (raft *Raft) logRecovery(raftMsg * infra.RaftMessage) {
+	log.Println("RAFT: Got log for recovery...")
+	//TODO
 }
 
 func (raft *Raft) becomeFollower() {
@@ -253,10 +363,10 @@ func (raft *Raft) becomeLeader() {
 	raft.StateLock.Lock()
 	raft.State = 2
 	raft.StateLock.Unlock()
-	go raft.leaderPinger()
+	go raft.sendAppendEntries()
 }
 
-func (raft *Raft) msgHandler() {
+func (raft *Raft) msgHandler() { //consider running many of there
 	var message *infra.Message
 	var raftMessage infra.RaftMessage
 	for {
@@ -266,15 +376,15 @@ func (raft *Raft) msgHandler() {
 				case "raft":
 					raftMessage = message.Request.(infra.RaftMessage)
 					switch message.SecType {
-					case "leaderPing":
-						go raft.leaderPingHandler(&raftMessage)
+					case "logRecovery":
+						go raft.logRecovery(&raftMessage)
 					case "appendEntry":
-						go raft.appendEntryHandler(&raftMessage)
+						go raft.appendEntryHandler(message)
 					case "voteRequest":
 						go raft.vote(message)
 					} 
 				case "client":
-					go raft.clientMessageHandler(message)
+					go raft.clientMessageHandler(message) //TODO: get rid of this, it should never get here
 				}
 		}
 	}
@@ -284,9 +394,14 @@ func (raft *Raft) clientMessageHandler(message *infra.Message) {
 	//REMEMBER: if at any point node is not a leader anymore, stop and reply with the leader's address 
 	clientMessage := message.Request.(infra.ClientMessage)
 	log.Println(clientMessage)
+
 	//first spin if I am a candidate
+	raft.TermLock.Lock()
+	defer raft.TermLock.Unlock()
+
 	raft.StateLock.Lock()
 	if raft.State == 1 {
+		log.Println("I'm a candidate...waiting for a resolution before responding to client")
 		raft.StateLock.Unlock()
 		for {
 			raft.StateLock.Lock()
@@ -295,34 +410,56 @@ func (raft *Raft) clientMessageHandler(message *infra.Message) {
 			}
 			raft.StateLock.Unlock()
 		}
-		raft.StateLock.Unlock()
-	}
+	} 
 
-	//if I am not the leader, tell the client who the leader is
+	//at this point the State is locked 
+
+	if raft.State == 0 {
+		log.Printf("I'm a follower..sending leader id %d to client\n", raft.getLeader())
+		//if I am not the leader, respond with the leader id
+		message := infra.Message{PrimaryType: "leaderId", Request: raft.getLeader()}
+		clientMessage.Response <- &message
+
+	} else { //I am the leader
+		log.Printf("I'm a leader..waiting for a quorom...\n")
+		raft.LogNumLock.Lock()
+
+		//IDEA:
+		/*
+		- append the log and inrcrement the number
+		- wait for commit channel / die channel / client timeout
+			- in the leader pinger, the append entry will send the latest log
+			- if got a failure, send the whole log and try again (use code below)
+			- when majority of nodes respond, respond here to the client
+		- when getting a commit channel msg, process the request
+		*/
+
+
+		//append the message to the log and let the pinger distribute it
+		raft.MsgLog = append(raft.MsgLog, &infra.AppendMessage{Term: raft.Term, LogNum: raft.LogNum, Msg: clientMessage})
+		raft.LogNum += 1
+		raft.LogConsistencyFlag = false
+		
+		//spin until log is consistent
+		raft.LogNumLock.Unlock()
+		for {
+			raft.LogNumLock.Lock()
+			if raft.LogConsistencyFlag {
+				raft.LogNumLock.Unlock()
+				break
+			}
+			raft.LogNumLock.Unlock()
+		}
+		log.Printf("Got a quorom...responding to client\n")
+		//process the request (ask business logic)
+
+		//send response to client
+		message := infra.Message{PrimaryType: "ok"}
+		clientMessage.Response <- &message
+		
+	} 
+	raft.StateLock.Unlock()
 	
-	if raft.State == 2 {
-		//respond with the leader's address
-	} else  {
-		//spin until I'm in a different state
-	}
-	
-}
-func (raft *Raft) appendEntryHandler(entry *infra.RaftMessage) {
-	//TODO: if I am a candidate, wait to get a signal from the raft channel
-
-	//TODO: if I am not the leader, respond with the leader's address
-
-	//TODO: if I am the leader:
-		//send append to everyone else
-		//wait for their responses, if got a qourom, send commit
-		//wait for their responses
-	message := <- raft.MsgQueue
-	log.Printf("Got Client Message: %#v\n", *message)
-	
-
-	//respond
-	//response := Message{Tid: message.Tid, PrimaryType: "response", Request: message.Request}
-	//infra.QueueMessage(nodeConn.Queue, &response)
 }
 
 

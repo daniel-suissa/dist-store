@@ -12,7 +12,10 @@ import (
 	"io"
 	"strconv"
 )
+/* important checks
+	- all threads that register themselves should either remove themselves or go forever
 
+*/
 const DIALINTERVAL = 5
 const QUEUESIZE = 10
 const RESPONSESSIZE = 10
@@ -65,9 +68,23 @@ type RaftMessage struct {
 	Data interface{}
 }
 
-type ClientMessage struct {
+type AppendMessage struct {
 	Term int
-	Data interface{}
+	LogNum int
+	Msg ClientMessage
+}
+
+type ClientMessage struct {
+	Cmd string
+	Book Book
+	Conn net.Conn
+	Response chan *Message
+}
+
+type Book struct {
+	Id int
+	Title string
+	Author string
 }
 
 func GetId() int {
@@ -188,11 +205,11 @@ func acceptMessages(nodeConn *NodeConnection) {
 						}
 						thread.Responses <- &message
 						log.Println(message)
-					} else if message.PrimaryType == "raft" || message.PrimaryType == "client" {
+					} else if message.PrimaryType == "raft" || message.PrimaryType == "client" { //TODO: get rid of client, it should never get here
 						message.NodeAddr = nodeConn.nodeAddr
 						message.NodeId = nodeConn.Id
 						msgChan <- &message
-					} else if  message.PrimaryType == "id"{
+					} else if message.PrimaryType == "id"{
 						nodeId, ok := message.Request.(int)
 						if !ok {
 							panic("got an invalid id message")
@@ -210,6 +227,73 @@ func acceptMessages(nodeConn *NodeConnection) {
 	
 }
 
+func raftClientProcessRequest(message *Message) (*Message) {
+	
+	if message.SecType == "Id" { //respond to Id requests immediately
+		return &Message{PrimaryType: "Id", Request: id}
+	}
+
+	raftMessage, ok := message.Request.(RaftMessage)
+	if !ok {
+		log.Printf("Can't make sense of client request, dropping")
+		return nil
+	}
+
+	clientMessage, ok := raftMessage.Data.(ClientMessage)
+	if !ok {
+		log.Printf("Can't make sense of client request, dropping")
+		return nil
+	}
+
+	//prepare the message
+	clientMessage.Response = make(chan *Message, 1)
+	raftMessage.Data = clientMessage
+	message.Request = raftMessage
+	me := MakeThread()
+	msgChan <- message
+	response := <-me.Responses
+	removeThread(me.Tid)
+	return response
+}
+
+func clientMessageHandler(conn net.Conn, firstMessage *Message, dec *gob.Decoder, enc *gob.Encoder) {
+	log.Println("Got a new client connection...")
+	//process first message
+	//response := raftClientProcessRequest(firstMessage)
+	//sendMessageToClient(enc, response)
+
+	//start listening
+	var err error
+	request := &Message{}
+	for {
+		err = dec.Decode(request)
+		if err != nil {
+			if err == io.EOF {
+				log.Println("The connection was closed by the client")
+				return
+			} else {
+				log.Println("Error decoding GOB data:", err)
+				return
+			}
+			response := raftClientProcessRequest(request)
+			sendMessageToClient(enc, response)
+		}
+	}
+}
+
+func sendMessageToClient(enc *gob.Encoder, message *Message) {
+	err := enc.Encode(*message)
+	if err != nil {
+		//TODO: if error means the thread is gone, kill it
+		log.Println("Could not write message to client")
+		return 
+	}
+	if err != nil {
+		log.Println("Could not write message to client")
+		return
+	}
+}
+
 func (nodeConn *NodeConnection) sendMessage(message *Message) (error) {	
 	enc := nodeConn.Encoder
 	err := enc.Encode(*message) //marshall the request
@@ -219,7 +303,7 @@ func (nodeConn *NodeConnection) sendMessage(message *Message) (error) {
 	}
 	err = nodeConn.writer.Flush()
 	if err != nil {
-		return fmt.Errorf("%#v: Flush failed.",err)
+		return fmt.Errorf("%#v: Flush failed.", err)
 	}
 	return nil
 }
@@ -283,6 +367,9 @@ func createConn(conn net.Conn, reader *bufio.Reader, writer *bufio.Writer) *Node
 	if err != nil {
 		log.Printf("error decoding id message: %#v", err)
 		return nil
+	} else if message.PrimaryType == "client" {
+		go clientMessageHandler(conn, &message, nodeConn.Decoder, nodeConn.Encoder)
+		return nil
 	} else if message.PrimaryType != "id" {
 		log.Printf("error decoding id: got a different message")
 		return nil
@@ -295,7 +382,7 @@ func createConn(conn net.Conn, reader *bufio.Reader, writer *bufio.Writer) *Node
 	log.Printf("Checking if connection already exists...Id: %d", nodeId)
 	connMapLock.Lock()
 	defer connMapLock.Unlock()
-	if _, ok := connMap[nodeId]; ok {
+	if _, ok := connMap[nodeId]; ok { //check if the node is already
 		return connMap[nodeId]
 	}
 	connMap[nodeId] = &nodeConn
@@ -366,6 +453,7 @@ func messageThread() {
 
 func StartInfra(port string, backends []string, idstr string, defaultMsgChan chan *Message) {
 	gob.Register(RaftMessage{})
+	gob.Register(AppendMessage{})
 	gob.Register(ClientMessage{})
 	connMap = make(map[int]*NodeConnection)
 	threadMap = make(map[int32]*Thread)

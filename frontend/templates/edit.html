@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<html>
+<head>
+	<title>Edit a Book</title>
+</head>
+<body>
+	<form action="/update/{{.Id}}" method="post">
+	    Title:<input type="text" name="title", value="{{.Title}}">
+	    Author:<input type="text" name="author", value="{{.Author}}">
+	    <input type="submit" value="Update">
+	</form>
+</body>
+</html>
