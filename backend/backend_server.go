@@ -3,6 +3,7 @@ package main
 import (
 	"./infra"
 	"./raft"
+	"./business_logic"
 	"os"
 	"sync"
 	"fmt"
@@ -59,6 +60,7 @@ func main() {
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 	port, backendAddrs, id := parseCmdArgs(args)
+	business_logic.InitBookMap()
 	raft := raft.InitRaft()
 	infra.StartInfra(port, backendAddrs, id, raft.MsgQueue)
 	//go messageThread()

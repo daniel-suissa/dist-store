@@ -9,10 +9,11 @@ import (
 	"net"
 	"encoding/gob"
 	"fmt"
-	//"time"
+	"time"
 	"sync"
 	"strings"
 	"../common"
+
 )
 
 
@@ -32,6 +33,7 @@ import (
 	//response can potentially time out, but only if the node hit is a candidate, in that case hit a different node
 
 const HEALTHINTERVAL = 5
+const RESPONSETIMEOUT = 200
 
 type MessageWrapper struct {
 	ResponseChan chan *common.Message
@@ -116,6 +118,9 @@ func sendRequestToLeader(message *common.Message, serverMap map[int]string) *com
 			log.Println("dropping extraneous id message...")
 			serverConnLock.Lock()
 			res = leaderConn.acceptRespnse()
+			if res.PrimaryType == "timeout" {
+				return res
+			}
 			serverConnLock.Unlock()
 			// this is the server telling us its id again
 			} else {
@@ -228,12 +233,23 @@ func (serverConn *ServerConnection) sendRequest(request *common.Message) (error)
 //recieves and unmarshalls an id->Book map from the backend
 func (serverConn *ServerConnection) acceptRespnse() *common.Message {
 	var res *common.Message
-	err := serverConn.dec.Decode(&res)
-	if err != nil {
-		log.Println("Error Decoding: ", err)
-		return nil
+	var err error
+	timer := time.NewTimer(time.Duration( RESPONSETIMEOUT * time.Millisecond))
+	decodeErr := make(chan error, 1)
+	go func() {
+		decodeErr <- serverConn.dec.Decode(&res)
+	}()
+	select {
+		case err = <- decodeErr:
+			if err != nil {
+				log.Println("Error Decoding: ", err)
+				return nil
+			} else {
+				return res
+			}
+		case <-timer.C:
+			return &common.Message{PrimaryType: "timeout"}
 	}
-	return res
 }
 
 

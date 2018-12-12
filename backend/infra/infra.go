@@ -128,9 +128,9 @@ func dispatchMessages(nodeConn *NodeConnection) {
 	        	//if fails, put a failure in accepqueue
 	        	err = nodeConn.sendMessage(message)	
 	        	if err != nil {
-	        		log.Printf("Could not send message %#v, sending failure instead: %#v", *message, err)
+	        		log.Printf("Could not dispatch message %#v, sending failure instead: %#v", *message, err)
 	        		failureResponse := common.Message{Tid: message.Tid, PrimaryType: "response", SecType: "failure"}
-	        		QueueMessage(nodeConn.Queue, &failureResponse)
+	        		getThread(message.Tid).Responses <- &failureResponse
 	        	}
         }
 	}
@@ -171,8 +171,9 @@ func acceptMessages(nodeConn *NodeConnection) {
 						thread = getThread(message.Tid)
 						if thread == nil {
 							log.Printf("non existing thread destination for message %#v, dropping", message)
-						} 
-						thread.Responses <- &message
+						} else {
+							thread.Responses <- &message
+						}
 						
 					} else if message.PrimaryType == "raft" || message.PrimaryType == "client" { //TODO: get rid of client, it should never get here
 						message.NodeAddr = nodeConn.nodeAddr

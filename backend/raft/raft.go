@@ -10,6 +10,9 @@ import (
 	"strconv"
 )
 
+
+
+//A node only votes if the candidate has a longer node that it has
 /*
 Messages that a node can send:
 	- Append Entry: 
@@ -164,6 +167,7 @@ func (raft *Raft) getLeader() int {
 }
 
 func (raft *Raft) setLeader(newLeader int) {
+	log.Printf("My new oh mighty leader is node %d\n", newLeader)
 	raft.LeaderIdLock.Lock()
 	raft.LeaderId = newLeader
 	raft.LeaderIdLock.Unlock()
@@ -179,7 +183,7 @@ func (raft *Raft) leaderTimer () {
 		select {
 		case message = <-raft.PingChan:
 			//check term number
-			//log.Printf("Got append with term %d, my term is %d\n", message.Term, raft.Term)
+			log.Printf("Got append with term %d, my term is %d\n", message.Term, raft.Term)
 			if message.Term >= raft.Term {
 				//got a valid Append entry 
 				//accept this as my leader
@@ -203,7 +207,7 @@ func (raft *Raft) toElection() {
 	raft.setState(1)
 	raft.Term += 1
 	thisTerm := raft.Term
-	voteRequest := common.RaftMessage{Term: raft.Term}
+	voteRequest := common.RaftMessage{Term: raft.Term, LastComittedLog: raft.getLastCommittedLogNum()}
 	raft.TermLock.Unlock()
 	
 	me := infra.MakeThread()
@@ -237,7 +241,8 @@ func (raft *Raft) toElection() {
 				return
 			case <-timer.C:
 				log.Printf("Election timeout for term %d, going to elections...\n", thisTerm)
-				go raft.toElection()
+				raft.becomeFollower()
+
 				return
 		}
 	}
@@ -249,10 +254,11 @@ func (raft *Raft) vote(message *common.Message) {
 		log.Println("can't get raft message out of message")
 		return
 	}
-	log.Printf("RAFT: got a vote request for term %d (Node %d) : %#v\n", raftMessage.Term, message.NodeId ,*message)
 	term := raft.getTerm()
+	log.Printf("RAFT: got a vote request for term %d (Node %d) : %#v\n My term is %d\n", raftMessage.Term, message.NodeId ,*message, term)
+	
 
-	if raftMessage.Term > term {
+	if raftMessage.Term > term && raftMessage.LastComittedLog >= raft.getLastCommittedLogNum() { //only vote for higher term nodes with last comitted log >= mine
 		//got an VoteRequest entry with larger term than mine
 		//voteYes
 		raft.setTerm(raftMessage.Term)
@@ -274,6 +280,9 @@ func (raft *Raft) sendAppendEntries() {
 	var votes int
 	neededVotes := infra.GetClusterSize() / 2 + 1
 	log.Printf("starting to send append entries with term %d\n", term)
+	var votesTimer *time.Timer
+	var votedTids []int32
+	var votedNodes []int
 	for {
 		start := time.Now()
 		select {
@@ -281,15 +290,16 @@ func (raft *Raft) sendAppendEntries() {
 				log.Printf("Killed: stop sending appends for term %d. Timer elapsed: %#v\n", term, time.Since(start))
 				return
 			default:
-				log.Print("going to send appned")
 				logToSend := raft.getUncommitedLog()
 				raftMsg := common.RaftMessage{Term: term, Data: logToSend, LastComittedLog: raft.getLastCommittedLogNum()}
-				log.Print("sent append")
 				infra.QueueMessageForAll(&common.Message{Tid: me.Tid, PrimaryType: "raft", SecType: "appendEntry", Request: raftMsg})
 				
 				if len(logToSend) > 0 {
 					votes = 1 // vote for myself
+					votedNodes = votedNodes[:0]
+					votedTids = votedTids[:0]
 					log.Printf("Waiting for qourom of Oks...")
+					votesTimer = getTimer(3)
 					SecondLoop:
 					for {
 						select {
@@ -299,22 +309,26 @@ func (raft *Raft) sendAppendEntries() {
 								if response.SecType == "inconsistentLog" {
 									go raft.sendLogForRecovery(response.NodeId)
 								} else if response.SecType[:8] == "appendOk" {
-									targetTid, _ := strconv.Atoi(response.SecType[9:])
-									votes += 1
-									if votes >= neededVotes {
-										log.Printf("Got Qourom") //here send a commit message and don't worry about the response
-										infra.QueueMessage(infra.GetConn(response.NodeId).Queue, &common.Message{
-											Tid: int32(targetTid),
-											PrimaryType: "response",
-											SecType: "commit",
-											Request: common.CommitMessage{Start: raft.getLastCommittedLogNum()+ 1, End: raft.getLogNum()}}) //half open range
+									targetTid, _ := strconv.Atoi(response.SecType[8:])
+									votedTids = append(votedTids, int32(targetTid))
+									votedNodes = append(votedNodes, response.NodeId)
 
-										raft.commitMessages()
-										break SecondLoop
-									}
+									votes += 1
 								}
 							}
-							
+						case <-votesTimer.C:
+							if votes >= neededVotes {
+								log.Printf("Got Qourom") //here send a commit message and don't worry about the response
+								for i, _ := range(votedTids) {
+									infra.QueueMessage(infra.GetConn(votedNodes[i]).Queue, &common.Message{
+									Tid: votedTids[i],
+									PrimaryType: "response",
+									SecType: "commit",
+									Request: common.CommitMessage{Start: raft.getLastCommittedLogNum()+ 1, End: raft.getLogNum()}}) //half open range
+								}
+								raft.commitMessages()
+								break SecondLoop
+							}
 						case <-raft.LeaderPingerKiller:
 							log.Printf("Killed: stop sending appends for term Timer elapsed: %#v\n", term, time.Since(start))
 							//whoever did this will change the states
@@ -335,7 +349,8 @@ func (raft *Raft) commitMessages() {
 	raft.LogNumLock.Lock()
 	defer raft.LogNumLock.Unlock()
 	i := raft.LastCommittedLogNum + 1
-	for i < raft.LogNum {
+	log.Printf("Committing logs %d through %d inclusive\n", i, raft.LogNum)
+	for i <= raft.LogNum {
 		raft.MsgLog[i].IsCommited = true
 		raft.LastCommittedLogNum = i
 		i++
@@ -349,6 +364,14 @@ func getTimer(divisor int) *time.Timer {
 	return timer
 }
 
+func (raft *Raft) waitForAppendToGetCommitted(logNum int) {
+	raft.LogNumLock.Lock()
+	for !raft.MsgLog[logNum].IsCommited {
+		raft.LogNumLock.Unlock()
+		raft.LogNumLock.Lock()
+	}
+	raft.LogNumLock.Unlock()
+}
 func (raft *Raft) extendLogAndCommit(appendLog []*common.AppendMessage) { //not thread safe (need to acquire lock before calling)
 	for _, apnd := range(appendLog) {
 		apnd.IsCommited = true
@@ -356,22 +379,29 @@ func (raft *Raft) extendLogAndCommit(appendLog []*common.AppendMessage) { //not 
 		raft.LastCommittedLogNum = apnd.LogNum
 	}
 	raft.LogNum = raft.LastCommittedLogNum
+
+	//print the state of the log
+	print()
+
+	//process the appends
+
+	//print the state of the db
 }
 func (raft *Raft) appendEntryHandler(message *common.Message) {
 	//this function assumes that only the leader (or someone that should be the leader) 
 	//sends append messages
-	log.Printf("Got append")
-
+	log.Printf("got append")
 	//if got ping of higher term an am leader / in election - kill channels and become follower
 	raftMsg, _ := message.Request.(common.RaftMessage)
 	raft.PingChan <- &raftMsg // notify the leaderTimer that a message is in
+	log.Printf("notified pinger thread")
 	term := raft.getTerm()
 	state := raft.getState()
 	logNum := raft.getLogNum()
 	me := infra.MakeThread()
 	defer infra.RemoveThread(me.Tid)
 
-	if state != 0 && raftMsg.Term >= term { 
+	if state != 0 && raftMsg.Term >= term && raftMsg.LastComittedLog >= raft.getLastCommittedLogNum() { 
 		log.Printf("Got a message with a higher term than me: %#v\n", *message)
 		if state == 1 { //if candidate, kill elections
 			raft.ElectionsKiller <- 1
@@ -383,9 +413,12 @@ func (raft *Raft) appendEntryHandler(message *common.Message) {
 		raft.becomeFollower() //will only be able to start after StateLock is released
 	} 
 	
-	term = raft.getTerm() 
-	if raftMsg.Term == term {
-		
+
+	log.Printf("Processing append...")
+	if raftMsg.Term >= term {
+		if raft.getLeader() != message.NodeId {
+			raft.setLeader(message.NodeId)
+		}
 		appndLog, _ := raftMsg.Data.([]*common.AppendMessage)
 
 		if len(appndLog) == 0 {
@@ -393,11 +426,7 @@ func (raft *Raft) appendEntryHandler(message *common.Message) {
 			if raftMsg.LastComittedLog != raft.getLastCommittedLogNum() {
 				log.Printf("Got a new appendEntry (log %d) inconsistent with my log (log %d)", raftMsg.LastComittedLog, raft.getLastCommittedLogNum())
 				//respond with recovery request
-				leaderConn := infra.GetConn(message.NodeId)
-				infra.QueueMessage(leaderConn.Queue, &common.Message{
-						Tid: message.Tid,
-						PrimaryType: "response",
-						SecType: "inconsistentLog"})
+				raft.requestLogRecovery(message.NodeId)
 			}
 
 		} else if appndLog[0].LogNum == logNum + 1 {
@@ -406,6 +435,7 @@ func (raft *Raft) appendEntryHandler(message *common.Message) {
 
 			//respond
 			leaderConn := infra.GetConn(message.NodeId)
+			log.Printf("Respinding with: %s\n", strconv.Itoa(int(me.Tid)))
 			infra.QueueMessage(leaderConn.Queue, &common.Message{
 					Tid: message.Tid,
 					PrimaryType: "response",
@@ -414,16 +444,13 @@ func (raft *Raft) appendEntryHandler(message *common.Message) {
 
 			//now wait for commit
 			<- me.Responses
+			log.Printf("Got a commit message")
 			raft.extendLogAndCommit(appndLog)
 
 		} else if appndLog[0].LogNum > logNum || appndLog[0].LogNum < logNum{
-			log.Printf("Got a new appendEntry (log %d) inconsistent with my log (log %d)", appndLog[0].LogNum, raft.LogNum)
 			//respond with recovery request
-			leaderConn := infra.GetConn(message.NodeId)
-			infra.QueueMessage(leaderConn.Queue, &common.Message{
-					Tid: message.Tid,
-					PrimaryType: "response",
-					SecType: "inconsistentLog"})
+			log.Printf("Got a new appendEntry (log %d) inconsistent with my log (log %d). Asking for recovery", appndLog[0].LogNum, raft.LogNum)
+			raft.respondWithLogRecovery(message.NodeId, message.Tid)
 		} 
 		
 	}
@@ -431,6 +458,7 @@ func (raft *Raft) appendEntryHandler(message *common.Message) {
 	//if got ping of a lower term, drop it
 }
 func (raft *Raft) sendLogForRecovery(nodeId int) {
+	log.Printf("Sending log recovery for node id: %d", nodeId)
 	term := raft.getTerm()
 	raft.LogNumLock.Lock()
 	defer raft.LogNumLock.Unlock()
@@ -444,15 +472,38 @@ func (raft *Raft) sendLogForRecovery(nodeId int) {
 	infra.QueueMessage(conn.Queue, &msg)
 }
 func (raft *Raft) logRecovery(raftMsg * common.RaftMessage) {
-	log.Println("RAFT: Got log for recovery...")
+	log.Println("RAFT: Got log for recovery...recovering..")
 	raft.LogNumLock.Lock()
 	defer raft.LogNumLock.Unlock()
 
-	log, _ := raftMsg.Data.([]*common.AppendMessage)
-	raft.MsgLog = log
+	msgLog, _ := raftMsg.Data.([]*common.AppendMessage)
+	raft.MsgLog = msgLog
 	raft.LogNum = raft.MsgLog[len(raft.MsgLog)-1].LogNum
 	raft.LastCommittedLogNum = raft.LogNum
+	log.Println("RAFT: Finished recovering my log..")
 	return
+}
+
+func (raft *Raft) requestLogRecovery(nodeId int) {
+	raft.LogNumLock.Lock()
+	defer raft.LogNumLock.Unlock()
+	leaderConn := infra.GetConn(nodeId)
+	infra.QueueMessage(leaderConn.Queue, &common.Message{
+			PrimaryType: "raft",
+			SecType: "inconsistentLog",
+			Request: common.RaftMessage{}})
+	log.Printf("Requested log recovery")
+}
+func (raft *Raft) respondWithLogRecovery(nodeId int, targetThreadId int32) {
+	raft.LogNumLock.Lock()
+	defer raft.LogNumLock.Unlock()
+	leaderConn := infra.GetConn(nodeId)
+	infra.QueueMessage(leaderConn.Queue, &common.Message{
+			Tid: targetThreadId,
+			PrimaryType: "response",
+			SecType: "inconsistentLog",
+			Request: common.RaftMessage{}})
+	log.Printf("Responded with log recovery")
 }
 
 func (raft *Raft) becomeFollower() {
@@ -482,6 +533,8 @@ func (raft *Raft) msgHandler() { //consider running many of there
 						go raft.appendEntryHandler(message)
 					case "voteRequest":
 						go raft.vote(message)
+					case "inconsistentLog":
+						go raft.sendLogForRecovery(message.NodeId)
 					} 
 				case "client":
 					go raft.clientMessageHandler(message) //TODO: get rid of this, it should never get here
@@ -517,6 +570,7 @@ func (raft *Raft) clientMessageHandler(message *common.Message) {
 		//if I am not the leader, respond with the leader id
 		message := common.Message{PrimaryType: "leaderId", Request: raft.getLeader()}
 		clientMessage.Response <- &message
+		raft.StateLock.Unlock()
 
 	} else { //I am the leader
 		log.Printf("I'm a leader..waiting for a quorom...\n")
@@ -537,14 +591,12 @@ func (raft *Raft) clientMessageHandler(message *common.Message) {
 		raft.LogNum += 1
 		logNum := raft.LogNum
 		raft.MsgLog = append(raft.MsgLog, &common.AppendMessage{Term: term, LogNum: raft.LogNum, Msg: clientMessage})		
-
 		//spin until log is consistent
 		log.Printf("Appended log %d\n", raft.LogNum)
 		raft.StateLock.Unlock()
 		raft.LogNumLock.Unlock()
-		
-		log.Printf("Waiting...\n")
-		for raft.getLastCommittedLogNum() >= logNum{}
+		log.Printf("Waiting for log: %d to get committed\n", logNum)
+		raft.waitForAppendToGetCommitted(logNum)
 
 		log.Printf("Got a quorom...responding to client\n")
 		//process the request (ask business logic)
