@@ -12,6 +12,7 @@ import (
 	//"time"
 	"sync"
 	"strings"
+	"../common"
 )
 
 
@@ -32,35 +33,9 @@ import (
 
 const HEALTHINTERVAL = 5
 
-type Message struct {
-	Tid int32
-	PrimaryType string
-	SecType string
-	NodeAddr string
-	NodeId int
-	Request interface{}
-}
-
 type MessageWrapper struct {
-	ResponseChan chan *Message
-	Message *Message
-}
-type RaftMessage struct {
-	Term int
-	Data interface{}
-}
-
-type ClientMessage struct {
-	Cmd string
-	Book Book
-	Conn net.Conn
-	Response chan *Message
-}
-
-type Book struct {
-	Id int
-	Title string
-	Author string
+	ResponseChan chan *common.Message
+	Message *common.Message
 }
 
 type ServerConnection struct {
@@ -75,7 +50,7 @@ type ServerConnection struct {
 //temporary for compilation
 type Request struct {
 	Cmd string // getall/getone/add/update/delete
-	Book Book
+	Book common.Book
 }
 
 var leaderConn ServerConnection
@@ -121,10 +96,10 @@ func serverConnInit(serverAddr string) (*ServerConnection) {
 //have a pingack thread - every ping is declares not confirmed, every ack declares confirmed
 //at the beginning ask for all ids 
 
-func sendRequestToLeader(message *Message, serverMap map[int]string) *Message {
+func sendRequestToLeader(message *common.Message, serverMap map[int]string) *common.Message {
 	
 	
-	var res *Message
+	var res *common.Message
 	for {
 		serverConnLock.Lock()
 		err := leaderConn.sendRequest(message)
@@ -134,7 +109,6 @@ func sendRequestToLeader(message *Message, serverMap map[int]string) *Message {
 		}
 		res = leaderConn.acceptRespnse()
 		serverConnLock.Unlock()
-		leaderId, _ := res.Request.(int)
 		//TODO: handle case when response is not recieved (timeout)
 		//TODO: handle failure of sendRequest
 		for {
@@ -152,6 +126,7 @@ func sendRequestToLeader(message *Message, serverMap map[int]string) *Message {
 
 		log.Printf("Res: %#v\n", res)
 		if res.PrimaryType == "leaderId" {
+			leaderId, _ := res.Request.(int)
 			for {
 				log.Printf("There's a new leader, changing to %s with id %d\n",serverMap[leaderId], leaderId )
 				//there's a new leader in town, call until connection is made
@@ -180,7 +155,7 @@ func connManager(reqChan chan *MessageWrapper) {
 	for _, addr := range(backends) {
 		serverConn := serverConnInit(addr)
 		if serverConn != nil {
-			serverConn.sendRequest(&Message{PrimaryType: "client", SecType: "Id"})
+			serverConn.sendRequest(&common.Message{PrimaryType: "client", SecType: "Id"})
 			res := serverConn.acceptRespnse()
 			id, _ := res.Request.(int)
 			log.Printf("Sever %s at id: %d \n", addr, id)
@@ -233,7 +208,7 @@ func Open(addr string) (*net.Conn, error) {
 
 //sends `request` to the backend server at serverAddr
 //returns a stream to the caller (so it can fetch a response)
-func (serverConn *ServerConnection) sendRequest(request *Message) (error) {
+func (serverConn *ServerConnection) sendRequest(request *common.Message) (error) {
 	
 	log.Printf("Sending: \n%#v\n", request)
 	
@@ -251,14 +226,13 @@ func (serverConn *ServerConnection) sendRequest(request *Message) (error) {
 
 
 //recieves and unmarshalls an id->Book map from the backend
-func (serverConn *ServerConnection) acceptRespnse() *Message {
-	var res *Message
+func (serverConn *ServerConnection) acceptRespnse() *common.Message {
+	var res *common.Message
 	err := serverConn.dec.Decode(&res)
 	if err != nil {
 		log.Println("Error Decoding: ", err)
 		return nil
 	}
-	log.Printf("Response Recieved!\n")
 	return res
 }
 
@@ -414,8 +388,8 @@ func parseCmdArgs(args []string) (string, []string){
 }
 
 func main() {
-	gob.Register(RaftMessage{})
-	gob.Register(ClientMessage{})
+	gob.Register(common.RaftMessage{})
+	gob.Register(common.ClientMessage{})
 
 	//fetch command line argument for custom port and backend address
 	
@@ -427,7 +401,7 @@ func main() {
 	//get server connection stream
 	reqChan := make(chan *MessageWrapper, 100)
 	go connManager(reqChan)
-	testMsg := MessageWrapper{ResponseChan: make(chan *Message), Message: &Message{PrimaryType: "client", Request: RaftMessage{Data: ClientMessage{Cmd: "test"}}}}
+	testMsg := MessageWrapper{ResponseChan: make(chan *common.Message), Message: &common.Message{PrimaryType: "client", Request: common.ClientMessage{Cmd: "test"}}}
 	reqChan <- &testMsg
 	res := <- testMsg.ResponseChan
 	log.Printf("res: %#v",res)

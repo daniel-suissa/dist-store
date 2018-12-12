@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"io"
 	"strconv"
+	"../../common"
 )
 /* important checks
 	- all threads that register themselves should either remove themselves or go forever
@@ -26,7 +27,7 @@ var connMapLock sync.RWMutex
 var threadMap map[int32]*Thread
 var threadMapLock sync.RWMutex
 
-var msgChan chan *Message // where all messages that are not responses go
+var msgChan chan *common.Message // where all messages that are not responses go
 
 var id int
 var tid int32
@@ -37,7 +38,7 @@ type NodeConnection struct {
 	nodeAddr string
 	reader *bufio.Reader
 	writer *bufio.Writer
-	Queue chan *Message
+	Queue chan *common.Message
 	QueueLock sync.RWMutex
 	listenThreadId int32
 	dispatchTheadId int32
@@ -47,45 +48,14 @@ type NodeConnection struct {
 }
 
 
-type Message struct {
-	Tid int32
-	PrimaryType string
-	SecType string
-	NodeAddr string
-	NodeId int
-	Request interface{}
-}
+
 
 type Thread struct {
 	Tid int32
 	KillChan chan int
-	Responses chan *Message
+	Responses chan *common.Message
 }
 
-
-type RaftMessage struct {
-	Term int
-	Data interface{}
-}
-
-type AppendMessage struct {
-	Term int
-	LogNum int
-	Msg ClientMessage
-}
-
-type ClientMessage struct {
-	Cmd string
-	Book Book
-	Conn net.Conn
-	Response chan *Message
-}
-
-type Book struct {
-	Id int
-	Title string
-	Author string
-}
 
 func GetId() int {
 	return id
@@ -105,13 +75,12 @@ func MakeThread() *Thread {
 	thread := Thread{}
 	thread.Tid = atomic.AddInt32(&tid, 1)
 	thread.KillChan = make(chan int, 1)
-	thread.Responses = make(chan *Message, RESPONSESSIZE)
+	thread.Responses = make(chan *common.Message, RESPONSESSIZE)
 	insertThread(&thread)
 	return &thread
 }
 
 func GetConn(id int) *NodeConnection {
-	log.Printf("INFRA: getting conn %d from map %#v", id, connMap)
 	if conn, found := connMap[id]; found {
 		return conn
 	}
@@ -124,7 +93,7 @@ func insertThread(thread *Thread) {
 	threadMap[thread.Tid] = thread
 }
 
-func removeThread(id int32) {
+func RemoveThread(id int32) {
 	threadMapLock.Lock()
 	defer threadMapLock.Unlock()
 	delete(threadMap, id)
@@ -144,23 +113,23 @@ func getThread(id int32) *Thread {
 func dispatchMessages(nodeConn *NodeConnection) {
 	log.Printf("starting dispatch thread for node %s\n", nodeConn.nodeAddr)
 	me := MakeThread()
+	defer RemoveThread(me.Tid)
 	nodeConn.dispatchTheadId = me.Tid
 	queue := nodeConn.Queue
-	var message *Message
+	var message *common.Message
 	var err error
 	for {
 		select {
 	        case <- me.KillChan:
 	        	log.Printf("Node %s is gone, stopping dispatching \n", nodeConn.nodeAddr)
 	        	//TODO: if die, put failures in the right threads
-	            removeThread(me.Tid)
 	            return
 	        case message = <- queue:
 	        	//if fails, put a failure in accepqueue
 	        	err = nodeConn.sendMessage(message)	
 	        	if err != nil {
 	        		log.Printf("Could not send message %#v, sending failure instead: %#v", *message, err)
-	        		failureResponse := Message{Tid: message.Tid, PrimaryType: "response", SecType: "failure"}
+	        		failureResponse := common.Message{Tid: message.Tid, PrimaryType: "response", SecType: "failure"}
 	        		QueueMessage(nodeConn.Queue, &failureResponse)
 	        	}
         }
@@ -171,15 +140,15 @@ func acceptMessages(nodeConn *NodeConnection) {
 	log.Printf("starting accept thread for node %s\n", nodeConn.nodeAddr)
 	//get Message and put in threads channels here
 	me := MakeThread()
+	defer RemoveThread(me.Tid)
 	nodeConn.listenThreadId = me.Tid
-	var message Message
+	var message common.Message
 	var thread *Thread
 	for {
 		select {
 			case <- me.KillChan:
 				log.Printf("Node %s is gone, stopping listening \n", nodeConn.nodeAddr)
 	        	//TODO: if die, think what to do with the messages
-	        	removeThread(me.Tid)
 	            return
 	        default:
 	        	dec := nodeConn.Decoder
@@ -201,15 +170,15 @@ func acceptMessages(nodeConn *NodeConnection) {
 					if message.PrimaryType == "response" {
 						thread = getThread(message.Tid)
 						if thread == nil {
-							log.Printf("non existing thread destination for message %#v", message)
-						}
+							log.Printf("non existing thread destination for message %#v, dropping", message)
+						} 
 						thread.Responses <- &message
-						log.Println(message)
+						
 					} else if message.PrimaryType == "raft" || message.PrimaryType == "client" { //TODO: get rid of client, it should never get here
 						message.NodeAddr = nodeConn.nodeAddr
 						message.NodeId = nodeConn.Id
 						msgChan <- &message
-					} else if message.PrimaryType == "id"{
+					} else if message.PrimaryType == "id" {
 						nodeId, ok := message.Request.(int)
 						if !ok {
 							panic("got an invalid id message")
@@ -227,46 +196,38 @@ func acceptMessages(nodeConn *NodeConnection) {
 	
 }
 
-func raftClientProcessRequest(message *Message) (*Message) {
+func raftClientProcessRequest(message *common.Message) (*common.Message) {
 	
 	if message.SecType == "Id" { //respond to Id requests immediately
-		return &Message{PrimaryType: "Id", Request: id}
+		return &common.Message{PrimaryType: "Id", Request: id}
 	}
 
-	raftMessage, ok := message.Request.(RaftMessage)
-	if !ok {
-		log.Printf("Can't make sense of client request, dropping")
-		return nil
-	}
-
-	clientMessage, ok := raftMessage.Data.(ClientMessage)
+	clientMessage, ok := message.Request.(common.ClientMessage)
 	if !ok {
 		log.Printf("Can't make sense of client request, dropping")
 		return nil
 	}
 
 	//prepare the message
-	clientMessage.Response = make(chan *Message, 1)
-	raftMessage.Data = clientMessage
-	message.Request = raftMessage
-	me := MakeThread()
+	clientMessage.Response = make(chan *common.Message, 1)
+	message.Request = clientMessage
 	msgChan <- message
-	response := <-me.Responses
-	removeThread(me.Tid)
+	response := <-clientMessage.Response
+	log.Printf("Sending response: %#v\n", response)
 	return response
 }
 
-func clientMessageHandler(conn net.Conn, firstMessage *Message, dec *gob.Decoder, enc *gob.Encoder) {
+func clientMessageHandler(conn net.Conn, nodeConn *NodeConnection,firstMessage *common.Message) {
 	log.Println("Got a new client connection...")
 	//process first message
-	//response := raftClientProcessRequest(firstMessage)
-	//sendMessageToClient(enc, response)
+	response := raftClientProcessRequest(firstMessage)
+	sendMessageToClient(nodeConn, response)
 
 	//start listening
 	var err error
-	request := &Message{}
+	request := &common.Message{}
 	for {
-		err = dec.Decode(request)
+		err = nodeConn.Decoder.Decode(request)
 		if err != nil {
 			if err == io.EOF {
 				log.Println("The connection was closed by the client")
@@ -276,25 +237,27 @@ func clientMessageHandler(conn net.Conn, firstMessage *Message, dec *gob.Decoder
 				return
 			}
 			response := raftClientProcessRequest(request)
-			sendMessageToClient(enc, response)
+			sendMessageToClient(nodeConn, response)
 		}
 	}
 }
 
-func sendMessageToClient(enc *gob.Encoder, message *Message) {
-	err := enc.Encode(*message)
+func sendMessageToClient(nodeConn *NodeConnection, message *common.Message) {
+	log.Printf("sending message to client: %#v\n", message)
+	err := nodeConn.Encoder.Encode(*message)
 	if err != nil {
 		//TODO: if error means the thread is gone, kill it
 		log.Println("Could not write message to client")
 		return 
 	}
+	err = nodeConn.writer.Flush()
 	if err != nil {
-		log.Println("Could not write message to client")
+		log.Printf("%#v: Flush failed.\n", err)
 		return
 	}
 }
 
-func (nodeConn *NodeConnection) sendMessage(message *Message) (error) {	
+func (nodeConn *NodeConnection) sendMessage(message *common.Message) (error) {	
 	enc := nodeConn.Encoder
 	err := enc.Encode(*message) //marshall the request
 	if err != nil {
@@ -309,11 +272,11 @@ func (nodeConn *NodeConnection) sendMessage(message *Message) (error) {
 }
 
 
-func QueueMessage(queue chan<- *Message, message *Message) {
+func QueueMessage(queue chan<- *common.Message, message *common.Message) {
 	queue <- message
 }
 
-func QueueMessageForAll(message *Message) {
+func QueueMessageForAll(message *common.Message) {
 	connMapLock.RLock()
 	defer connMapLock.RUnlock()
 	for _, nodeConn := range(connMap) {
@@ -352,23 +315,24 @@ func createConn(conn net.Conn, reader *bufio.Reader, writer *bufio.Writer) *Node
 	nodeConn.reader = reader
 	nodeConn.writer = writer
 	nodeConn.nodeAddr = conn.RemoteAddr().String()
-	nodeConn.Queue = make(chan *Message, QUEUESIZE)
+	nodeConn.Queue = make(chan *common.Message, QUEUESIZE)
 	var err error
 	//send and accept the nodeId
 	nodeConn.Encoder = gob.NewEncoder(nodeConn.writer)
 	nodeConn.Decoder = gob.NewDecoder(nodeConn.reader)
-	err = nodeConn.sendMessage(&Message{Tid: -1, PrimaryType: "id", Request: id})
+	err = nodeConn.sendMessage(&common.Message{Tid: -1, PrimaryType: "id", Request: id})
 	if err != nil {
 		log.Printf("Error sending message: %#v", err)
 	}
-	var message Message
+	var message common.Message
 	dec := nodeConn.Decoder
 	err = dec.Decode(&message)
 	if err != nil {
 		log.Printf("error decoding id message: %#v", err)
 		return nil
 	} else if message.PrimaryType == "client" {
-		go clientMessageHandler(conn, &message, nodeConn.Decoder, nodeConn.Encoder)
+		//TODO: pass the whole nodeConn here
+		go clientMessageHandler(conn, &nodeConn, &message)
 		return nil
 	} else if message.PrimaryType != "id" {
 		log.Printf("error decoding id: got a different message")
@@ -383,7 +347,7 @@ func createConn(conn net.Conn, reader *bufio.Reader, writer *bufio.Writer) *Node
 	connMapLock.Lock()
 	defer connMapLock.Unlock()
 	if _, ok := connMap[nodeId]; ok { //check if the node is already
-		return connMap[nodeId]
+		return nil
 	}
 	connMap[nodeId] = &nodeConn
 	nodeConn.Id = nodeId
@@ -439,22 +403,24 @@ func listen(port string) error {
 func messageThread() {
 	me := MakeThread()
 	types := []string{"A", "B", "C", "D"}
-	var message Message
-	var response *Message
+	var message *common.Message
+	var response *common.Message
 	for _, conn := range connMap {
 		for _,t := range types {
-			message = Message{Tid: me.Tid, PrimaryType: "client", Request: t}
-			QueueMessage(conn.Queue, &message)
+			message = &common.Message{Tid: me.Tid, PrimaryType: "client", Request: t}
+			QueueMessage(conn.Queue, message)
 			response = <- me.Responses
 			log.Printf("Thread %d got response: %#v\n", me.Tid, *response)
 		}
 	}
 }
 
-func StartInfra(port string, backends []string, idstr string, defaultMsgChan chan *Message) {
-	gob.Register(RaftMessage{})
-	gob.Register(AppendMessage{})
-	gob.Register(ClientMessage{})
+func StartInfra(port string, backends []string, idstr string, defaultMsgChan chan *common.Message) {
+	gob.Register(common.RaftMessage{})
+	gob.Register(common.AppendMessage{})
+	gob.Register([]*common.AppendMessage{})
+	gob.Register(common.ClientMessage{})
+	gob.Register(common.CommitMessage{})
 	connMap = make(map[int]*NodeConnection)
 	threadMap = make(map[int32]*Thread)
 	clusterSize = len(backends) + 1
