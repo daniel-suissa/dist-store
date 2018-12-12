@@ -1,16 +1,10 @@
 package business_logic
 
 import (
-	"bufio"
-	"log"
-	"net"
-	"io"
-	"encoding/gob"
-	"os"
 	"time"
 	"sync"
-	"fmt"
 	"sync/atomic"
+	"../../common"
 )
 
 //used to implement the mutex with the TryLock
@@ -59,26 +53,20 @@ func (m *Mutex) TryLock() bool {
 
 //initialize the book map with some initial records
 func InitBookMap() {
-	//books = make(map[int32]*Book)
 	initRing()
 	idCounter = 0
-	addBook(&Book{0, "Harry Potter", "J. K. Rolling"})
-	addBook(&Book{1, "Sapiens", "Yuval Noah Harari"})
-	addBook(&Book{2, "The Art of Happiness", "The Dalhi Lama"})
-	addBook(&Book{3, "Predictibly Unpredictable", "Dan Arieli"})
-	addBook(&Book{4, "Blink", "Malcolm Gladwell"})
-	addBook(&Book{5, "Principia Mathematica", "Bertrand Russel"})
+	addInitialBooks()
 }
 
-func resetRing() {
-	for _, lock := range(ringLocks) {
-		lock.Lock()
-	}
-	ring = ring[:0]
-	for i := 0; i < RINGSIZE; i++ {
-		ring = append(ring,make(map[int32]int))
-	}
+func addInitialBooks() {
+	addBook(&common.Book{0, "Harry Potter", "J. K. Rolling"})
+	addBook(&common.Book{1, "Sapiens", "Yuval Noah Harari"})
+	addBook(&common.Book{2, "The Art of Happiness", "The Dalhi Lama"})
+	addBook(&common.Book{3, "Predictibly Unpredictable", "Dan Arieli"})
+	addBook(&common.Book{4, "Blink", "Malcolm Gladwell"})
+	addBook(&common.Book{5, "Principia Mathematica", "Bertrand Russel"})
 }
+
 //sets up the ring sets and the locks for it
 func initRing() {
 	for i := 0; i < RINGSIZE; i++ {
@@ -110,7 +98,7 @@ func findInRing(bookId int32) int {
 }
 
 //safely add a book to the db
-func addBook(book *Book) {
+func addBook(book *common.Book) {
 	i := 0
 	for {
 		if len(ring[i]) > int(booksLen / 2) {
@@ -134,7 +122,7 @@ func addBook(book *Book) {
 }
 
 //safely delete a book from the db
-func deleteBook(book *Book) {
+func deleteBook(book *common.Book) {
 	ringPos := findInRing(book.Id)
 	defer ringLocks[ringPos].Unlock()
 	books.Delete(book.Id)
@@ -143,21 +131,21 @@ func deleteBook(book *Book) {
 }
 
 //safely sets the contents of a book in the db
-func editBook(book *Book) {
+func editBook(book *common.Book) {
 	ringPos := findInRing(book.Id)
 	defer ringLocks[ringPos].Unlock()
 	books.Store(book.Id, book)
 }
 
 //safely gets the updated contents of a book from the db
-func getBook(book *Book) Book {
+func getBook(book *common.Book) common.Book {
 	ringPos := findInRing(book.Id)
 	defer ringLocks[ringPos].Unlock()
 	ret, ok := books.Load(book.Id)
 	if !ok {
 		panic("somehow trying to get a book that isn't there")
 	}
-	retBook, ok := ret.(*Book)
+	retBook, ok := ret.(*common.Book)
 	if !ok {
 		panic("cant convert book to type Book")
 	}
@@ -165,40 +153,68 @@ func getBook(book *Book) Book {
 }
 
 //safely get a typesafe version of the book map
-func getAllBooks() map[int32]*Book {
-	retMap := make(map[int32]*Book)
+func getAllBooks() map[int32]*common.Book {
+	retMap := make(map[int32]*common.Book)
 	var id int32
-	var book *Book
+	var book *common.Book
 	books.Range(func(k interface{}, v interface{}) bool {
 		id = k.(int32)
-		book = v.(*Book)
+		book = v.(*common.Book)
 		retMap[id] = book
 		return true
 		})
 
 	return retMap
 }
-func Reprocess()
-//constantly listen for incoming commands and handle each command appropriately
-func HandleCmd(clientMsg *common.ClientMessage) () {
-		err = nil
-		switch {
-			case request.Cmd == "getall":
-				allBooks := getAllBooks()
-				err = sendMessage(allBooks, rw)
-			case request.Cmd == "getone":
-				err = sendMessage(getBook(&request.Book), rw)
-			case request.Cmd == "new": 
-				addBook(&request.Book)
-			case request.Cmd == "update":
-				editBook(&request.Book)
-			case request.Cmd == "delete":
-				deleteBook(&request.Book)
-			case request.Cmd == "ping":
-				err = sendMessage(1, rw)
-		}
-		if err != nil {
-			log.Println("Failed to send response: ", err)
-		}
+func Reprocess(msgLog []*common.AppendMessage) {
+	//get all locks before
+	for _, lock := range(ringLocks) {
+		lock.Lock()
+	}
+	//reset the ring
+	ring = ring[:0]
+	for i := 0; i < RINGSIZE; i++ {
+		ring = append(ring,make(map[int32]int))
+	}
+
+	addInitialBooks()
+
+	for _, appndMsg := range(msgLog) {
+		ProcessMsg(&appndMsg.Msg)
+	}
+
+
+	for _, lock := range(ringLocks) {
+		lock.Unlock()
 	}
 }
+
+func IsRead(clientMsg *common.ClientMessage) bool {
+	switch {
+		case clientMsg.Cmd == "getall":
+			return true
+		case clientMsg.Cmd == "getone":
+			book := getBook(&clientMsg.Book)
+			return true
+		}
+	return false
+}
+//constantly listen for incoming commands and handle each command appropriately
+func ProcessMsg(clientMsg *common.ClientMessage) (string, interface{}) {
+		switch {
+			case clientMsg.Cmd == "getall":
+				allBooks := getAllBooks()
+				return "slice", allBooks
+			case clientMsg.Cmd == "getone":
+				book := getBook(&clientMsg.Book)
+				return "book", book
+			case clientMsg.Cmd == "new": 
+				addBook(&clientMsg.Book)
+			case clientMsg.Cmd == "update":
+				editBook(&clientMsg.Book)
+			case clientMsg.Cmd == "delete":
+				deleteBook(&clientMsg.Book)
+		}
+		return nil, nil
+	}
+

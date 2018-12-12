@@ -2,6 +2,7 @@ package raft
 
 import (
 	"../infra"
+	"../business_logic"
 	"log"
 	"time"
 	"sync"
@@ -342,6 +343,21 @@ func (raft *Raft) sendAppendEntries() {
 }
 
 
+func getTimer(divisor int) *time.Timer {
+	timer := time.NewTimer(time.Duration( (rand.Intn(200) + 150) / divisor ) * time.Millisecond)
+	return timer
+}
+
+func (raft *Raft) waitForAppendToGetCommitted(logNum int) {
+	raft.LogNumLock.Lock()
+	for !raft.MsgLog[logNum].IsCommited {
+		raft.LogNumLock.Unlock()
+		raft.LogNumLock.Lock()
+	}
+	raft.LogNumLock.Unlock()
+}
+
+
 //lastCommitedLogNum and Log Num start at -1
 //LogNum is always the last index appended (add 1 before sending)
 
@@ -359,19 +375,6 @@ func (raft *Raft) commitMessages() {
 
 }
 
-func getTimer(divisor int) *time.Timer {
-	timer := time.NewTimer(time.Duration( (rand.Intn(200) + 150) / divisor ) * time.Millisecond)
-	return timer
-}
-
-func (raft *Raft) waitForAppendToGetCommitted(logNum int) {
-	raft.LogNumLock.Lock()
-	for !raft.MsgLog[logNum].IsCommited {
-		raft.LogNumLock.Unlock()
-		raft.LogNumLock.Lock()
-	}
-	raft.LogNumLock.Unlock()
-}
 func (raft *Raft) extendLogAndCommit(appendLog []*common.AppendMessage) { //not thread safe (need to acquire lock before calling)
 	for _, apnd := range(appendLog) {
 		apnd.IsCommited = true
@@ -381,9 +384,12 @@ func (raft *Raft) extendLogAndCommit(appendLog []*common.AppendMessage) { //not 
 	raft.LogNum = raft.LastCommittedLogNum
 
 	//print the state of the log
-	print()
+	
 
 	//process the appends
+	for _, apnd := range(appendLog) {
+		business_logic.ProcessMsg(&apnd.Msg)
+	}
 
 	//print the state of the db
 }
@@ -480,6 +486,7 @@ func (raft *Raft) logRecovery(raftMsg * common.RaftMessage) {
 	raft.MsgLog = msgLog
 	raft.LogNum = raft.MsgLog[len(raft.MsgLog)-1].LogNum
 	raft.LastCommittedLogNum = raft.LogNum
+	business_logic.Reprocess(msgLog)
 	log.Println("RAFT: Finished recovering my log..")
 	return
 }
@@ -573,38 +580,49 @@ func (raft *Raft) clientMessageHandler(message *common.Message) {
 		raft.StateLock.Unlock()
 
 	} else { //I am the leader
-		log.Printf("I'm a leader..waiting for a quorom...\n")
-		raft.LogNumLock.Lock()
-
-		//IDEA:
-		/*
-		- append the log and inrcrement the number
-		- wait for commit channel / die channel / client timeout
-			- in the leader pinger, the append entry will send the latest log
-			- if got a failure, send the whole log and try again (use code below)
-			- when majority of nodes respond, respond here to the client
-		- when getting a commit channel msg, process the request
-		*/
 
 
-		//append the message to the log and let the pinger distribute it
-		raft.LogNum += 1
-		logNum := raft.LogNum
-		raft.MsgLog = append(raft.MsgLog, &common.AppendMessage{Term: term, LogNum: raft.LogNum, Msg: clientMessage})		
-		//spin until log is consistent
-		log.Printf("Appended log %d\n", raft.LogNum)
-		raft.StateLock.Unlock()
-		raft.LogNumLock.Unlock()
-		log.Printf("Waiting for log: %d to get committed\n", logNum)
-		raft.waitForAppendToGetCommitted(logNum)
 
-		log.Printf("Got a quorom...responding to client\n")
-		//process the request (ask business logic)
+		//if read, process and respond
+		if business_logic.IsRead(&clientMessage.Msg) {
+			raft.StateLock.Unlock()
+			log.Printf("I'm a leader..responding to read request...\n")
+			typ, res := business_logic.ProcessMsg(&clientMessage.Msg)
+			message := common.Message{PrimaryType: "ok", SecType: typ, Request: res}
+			clientMessage.Response <- &message
+		} else {
+			log.Printf("I'm a leader..waiting for a quorom for write request...\n")
+			raft.LogNumLock.Lock()
 
-		//send response to client
-		message := common.Message{PrimaryType: "ok"}
-		clientMessage.Response <- &message
-		log.Printf("Sent response to client handler in INFRA\n")
+			//IDEA:
+			/*
+			- append the log and inrcrement the number
+			- wait for commit channel / die channel / client timeout
+				- in the leader pinger, the append entry will send the latest log
+				- if got a failure, send the whole log and try again (use code below)
+				- when majority of nodes respond, respond here to the client
+			- when getting a commit channel msg, process the request
+			*/
+
+
+			//append the message to the log and let the pinger distribute it
+			raft.LogNum += 1
+			logNum := raft.LogNum
+			raft.MsgLog = append(raft.MsgLog, &common.AppendMessage{Term: term, LogNum: raft.LogNum, Msg: clientMessage})		
+			//spin until log is consistent
+			log.Printf("Appended log %d\n", raft.LogNum)
+			raft.StateLock.Unlock()
+			raft.LogNumLock.Unlock()
+			log.Printf("Waiting for log: %d to get committed\n", logNum)
+			raft.waitForAppendToGetCommitted(logNum)
+
+			log.Printf("Got a quorom...responding to client\n")
+
+			//send response to client
+			message := common.Message{PrimaryType: "ok"}
+			clientMessage.Response <- &message
+			log.Printf("Sent response to client handler in INFRA\n")
+		}
 		
 	} 
 }
