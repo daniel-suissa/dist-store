@@ -422,6 +422,7 @@ func StartInfra(port string, backends []string, idstr string, defaultMsgChan cha
 	gob.Register(common.ClientMessage{})
 	gob.Register(common.CommitMessage{})
 	gob.Register(map[int32]*common.Book{})
+	gob.Register(common.Book{})
 	connMap = make(map[int]*NodeConnection)
 	threadMap = make(map[int32]*Thread)
 	clusterSize = len(backends) + 1

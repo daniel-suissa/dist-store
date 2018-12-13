@@ -444,7 +444,7 @@ func main() {
 	gob.Register(common.RaftMessage{})
 	gob.Register(common.ClientMessage{})
 	gob.Register(map[int32]*common.Book{})
-	gob.Register(sync.Map{})
+	gob.Register(common.Book{})
 	idToAddr = make(map[int]string)
 	addrToId = make(map[string]int)
 	//fetch command line argument for custom port and backend address
