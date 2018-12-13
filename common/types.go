@@ -38,7 +38,7 @@ type ClientMessage struct {
 }
 
 type Book struct {
-	Id int
+	Id int32
 	Title string
 	Author string
 }

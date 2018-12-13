@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"../../common"
+	"log"
 )
 
 //used to implement the mutex with the TryLock
@@ -167,6 +168,7 @@ func getAllBooks() map[int32]*common.Book {
 	return retMap
 }
 func Reprocess(msgLog []*common.AppendMessage) {
+	log.Printf("BUSINESS LOGIC: Resetting log and reprocessing\n")
 	//get all locks before
 	for _, lock := range(ringLocks) {
 		lock.Lock()
@@ -176,11 +178,11 @@ func Reprocess(msgLog []*common.AppendMessage) {
 	for i := 0; i < RINGSIZE; i++ {
 		ring = append(ring,make(map[int32]int))
 	}
-
+	idCounter = 0
 	addInitialBooks()
 
 	for _, appndMsg := range(msgLog) {
-		ProcessMsg(&appndMsg.Msg)
+		ProcessWrite(&appndMsg.Msg)
 	}
 
 
@@ -190,31 +192,37 @@ func Reprocess(msgLog []*common.AppendMessage) {
 }
 
 func IsRead(clientMsg *common.ClientMessage) bool {
-	switch {
-		case clientMsg.Cmd == "getall":
-			return true
-		case clientMsg.Cmd == "getone":
-			book := getBook(&clientMsg.Book)
-			return true
-		}
-	return false
+	if clientMsg.Cmd == "getall" || clientMsg.Cmd == "getone"{ 
+		return true
+	} else {
+		return false
+	}
+}
+
+
+func ProcessRead(clientMsg *common.ClientMessage) interface{} {
+	log.Printf("BUSINESS LOGIC: Processing %#v\n", *clientMsg)
+	if clientMsg.Cmd == "getall" {
+		return getAllBooks()
+	} else if clientMsg.Cmd == "getone"{
+		return getBook(&clientMsg.Book)
+	} else {
+		log.Printf("Something went terribly wrong with %#v\n", *clientMsg)
+		return nil
+	}
+
 }
 //constantly listen for incoming commands and handle each command appropriately
-func ProcessMsg(clientMsg *common.ClientMessage) (string, interface{}) {
-		switch {
-			case clientMsg.Cmd == "getall":
-				allBooks := getAllBooks()
-				return "slice", allBooks
-			case clientMsg.Cmd == "getone":
-				book := getBook(&clientMsg.Book)
-				return "book", book
-			case clientMsg.Cmd == "new": 
-				addBook(&clientMsg.Book)
-			case clientMsg.Cmd == "update":
-				editBook(&clientMsg.Book)
-			case clientMsg.Cmd == "delete":
-				deleteBook(&clientMsg.Book)
-		}
-		return nil, nil
+func ProcessWrite(clientMsg *common.ClientMessage) {
+	log.Printf("BUSINESS LOGIC: Processing %#v\n", *clientMsg)
+	if clientMsg.Cmd == "new" {
+		addBook(&clientMsg.Book)
+	} else if clientMsg.Cmd == "update" {
+		editBook(&clientMsg.Book)
+	} else if clientMsg.Cmd == "delete" {
+		deleteBook(&clientMsg.Book)
+	} else {
+		log.Printf("Something went terribly wrong with %#v\n", *clientMsg)
 	}
+}
 

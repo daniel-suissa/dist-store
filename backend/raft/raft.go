@@ -369,6 +369,7 @@ func (raft *Raft) commitMessages() {
 	for i <= raft.LogNum {
 		raft.MsgLog[i].IsCommited = true
 		raft.LastCommittedLogNum = i
+		business_logic.ProcessWrite(&raft.MsgLog[i].Msg)
 		i++
 	}
 	raft.LastCommittedLogNum = raft.LogNum
@@ -388,7 +389,7 @@ func (raft *Raft) extendLogAndCommit(appendLog []*common.AppendMessage) { //not 
 
 	//process the appends
 	for _, apnd := range(appendLog) {
-		business_logic.ProcessMsg(&apnd.Msg)
+		business_logic.ProcessWrite(&apnd.Msg)
 	}
 
 	//print the state of the db
@@ -584,11 +585,11 @@ func (raft *Raft) clientMessageHandler(message *common.Message) {
 
 
 		//if read, process and respond
-		if business_logic.IsRead(&clientMessage.Msg) {
+		if business_logic.IsRead(&clientMessage) {
 			raft.StateLock.Unlock()
 			log.Printf("I'm a leader..responding to read request...\n")
-			typ, res := business_logic.ProcessMsg(&clientMessage.Msg)
-			message := common.Message{PrimaryType: "ok", SecType: typ, Request: res}
+			res := business_logic.ProcessRead(&clientMessage)
+			message := common.Message{PrimaryType: "ok", Request: res}
 			clientMessage.Response <- &message
 		} else {
 			log.Printf("I'm a leader..waiting for a quorom for write request...\n")

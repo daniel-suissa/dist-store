@@ -13,6 +13,8 @@ import (
 	"sync"
 	"strings"
 	"../common"
+	"github.com/kataras/iris"
+	"strconv"
 
 )
 
@@ -33,12 +35,7 @@ import (
 	//response can potentially time out, but only if the node hit is a candidate, in that case hit a different node
 
 const HEALTHINTERVAL = 5
-const RESPONSETIMEOUT = 200
-
-type MessageWrapper struct {
-	ResponseChan chan *common.Message
-	Message *common.Message
-}
+const RESPONSETIMEOUT = 2000
 
 type ServerConnection struct {
 	serverAddr string
@@ -55,32 +52,68 @@ type Request struct {
 	Book common.Book
 }
 
-var leaderConn ServerConnection
-var serverConnLock sync.Mutex
+
+var addrToId map[string]int
+var idToAddr map[int]string
+
+var backendsLock sync.Mutex
+var leaderAddr string
+
+var leaderLock sync.Mutex
 var backends []string
 
 
 //id counter to create unique ids (since all records are in memory it is assumed an integer is enough)
 var idCounter int
 
-func getLeader() *ServerConnection {
-	serverConnLock.Lock()
-	leader := &leaderConn
-	serverConnLock.Unlock()
+
+func getIdFromAddr(addr string) int {
+	backendsLock.Lock()
+	defer backendsLock.Unlock()
+	id, ok := addrToId[addr]
+	if ok {
+		return id
+	}
+	return -1
+}
+
+func getAddrFromId(id int) string {
+	backendsLock.Lock()
+	defer backendsLock.Unlock()
+	addr, ok := idToAddr[id]
+	if ok {
+		return addr
+	}
+	return ""
+}
+
+func setBackend(id int, addr string) {
+	backendsLock.Lock()
+	defer backendsLock.Unlock()
+	idToAddr[id] = addr
+	addrToId[addr] = id
+}
+
+func getLeader() string {
+	leaderLock.Lock()
+	leader := leaderAddr
+	leaderLock.Unlock()
 	return leader
 }
 
-func setLeader(newLeader *ServerConnection) {
-	serverConnLock.Lock()
-	leaderConn = *newLeader
-	serverConnLock.Unlock()
+func setLeader(newLeaderId int) {
+	backendsLock.Lock()
+	defer backendsLock.Unlock()
+	leaderLock.Lock()
+	defer leaderLock.Unlock()
+	leaderAddr = idToAddr[newLeaderId]
 }
 
 //dials to the server and sets up the readwrite stream
 func serverConnInit(serverAddr string) (*ServerConnection) {
 	conn, err := Open(serverAddr) //open the connection and get a stream
 	if err != nil {
-		log.Printf("Client: Failed to open connection to %v: %v",serverAddr,err)
+		log.Printf("Failed to open connection to %v: %v",serverAddr,err)
 		return nil
 	}
 	rw := bufio.NewReadWriter(bufio.NewReader(*conn), bufio.NewWriter(*conn))
@@ -98,99 +131,82 @@ func serverConnInit(serverAddr string) (*ServerConnection) {
 //have a pingack thread - every ping is declares not confirmed, every ack declares confirmed
 //at the beginning ask for all ids 
 
-func sendRequestToLeader(message *common.Message, serverMap map[int]string) *common.Message {
-	
-	
+func sendRequestToLeader(message *common.Message) *common.Message {
+	var leaderConn *ServerConnection
 	var res *common.Message
 	for {
-		serverConnLock.Lock()
+		leaderConn = serverConnInit(getLeader())
+		if leaderConn == nil {
+			log.Printf("Can't connect to leader\n")
+			return nil
+		}
 		err := leaderConn.sendRequest(message)
 		if err != nil {
 			log.Printf("Error sending message: %#v\n", err)
 			return nil
 		}
 		res = leaderConn.acceptRespnse()
-		serverConnLock.Unlock()
 		//TODO: handle case when response is not recieved (timeout)
 		//TODO: handle failure of sendRequest
 		for {
 			if res.PrimaryType == "id" {
-			log.Println("dropping extraneous id message...")
-			serverConnLock.Lock()
-			res = leaderConn.acceptRespnse()
+				log.Println("dropping extraneous id message...")
+				res = leaderConn.acceptRespnse()
 			if res.PrimaryType == "timeout" {
 				return res
 			}
-			serverConnLock.Unlock()
 			// this is the server telling us its id again
 			} else {
 				break
 			}
 		}
-		
 
-		log.Printf("Res: %#v\n", res)
 		if res.PrimaryType == "leaderId" {
 			leaderId, _ := res.Request.(int)
-			for {
-				log.Printf("There's a new leader, changing to %s with id %d\n",serverMap[leaderId], leaderId )
-				//there's a new leader in town, call until connection is made
-				newLeader := serverConnInit(serverMap[leaderId])
-				if newLeader != nil {
-					setLeader(newLeader)
-					break
-				} else {
-					continue
-				}
-			}
+			log.Printf("There's a new leader, changing to %s with id %d\n",getAddrFromId(leaderId), leaderId )
+			setLeader(leaderId)
 		} else {
 			break
 		}
+	}
+	if leaderConn != nil {
+		(*leaderConn.conn).Close()
 	}
 	return res //at this point the message can only be ok or failure
 	
 }
 
-func connManager(reqChan chan *MessageWrapper) {
-	//first get all server ids (keep a list of backends)
-	
-	
-	log.Println("getting Ids..")
-	backendsMap := make(map[int]string)
-	for _, addr := range(backends) {
+
+func setUpBackendId(addr string) {
+	for {
 		serverConn := serverConnInit(addr)
 		if serverConn != nil {
 			serverConn.sendRequest(&common.Message{PrimaryType: "client", SecType: "Id"})
 			res := serverConn.acceptRespnse()
 			id, _ := res.Request.(int)
 			log.Printf("Sever %s at id: %d \n", addr, id)
-			backendsMap[id] = addr
+			setBackend(id, addr)
 			(*serverConn.conn).Close()
 			log.Printf("closed connection with %s\n", addr)
-		}	
-	}
-
-	//choose some leader
-	var tempLeader *ServerConnection
-	tempLeader = nil
-	for _, addr := range(backends) {
-		tempLeader = serverConnInit(addr)
-		if tempLeader != nil {
-			break
+			if leaderAddr == "" {
+				setLeader(id)
+			}
+			return
+		} else {
+			time.Sleep(time.Duration(500 * time.Millisecond))
 		}
 	}
-	if tempLeader == nil {
-		panic("Can't connect to any of the servers")
-	} else {
-		setLeader(tempLeader)
+}
+func connManager() {
+	//first get all server ids (keep a list of backends)
+	
+	
+	log.Println("getting Ids..")
+	leaderAddr = ""
+	for _, addr := range(backends) {
+		go setUpBackendId(addr)
 	}
-
-	var messageWrapper *MessageWrapper
-	for {
-		messageWrapper = <-reqChan
-		res := sendRequestToLeader(messageWrapper.Message, backendsMap)
-		messageWrapper.ResponseChan <- res
-	}
+	
 	//loop forever
 		//take a message from the reqChan
 		//send it to the leader
@@ -248,6 +264,7 @@ func (serverConn *ServerConnection) acceptRespnse() *common.Message {
 				return res
 			}
 		case <-timer.C:
+			log.Println("timing out on message..")
 			return &common.Message{PrimaryType: "timeout"}
 	}
 }
@@ -255,57 +272,7 @@ func (serverConn *ServerConnection) acceptRespnse() *common.Message {
 
 /*
 
-//asks backend to add a book and redirects to index
-func (serverConn *ServerConnection) addBookAndServeIndex(ctx iris.Context){
-    title, author := ctx.PostValue("title"), ctx.PostValue("author")
-    err := serverConn.sendRequest(Request{"new", Book{Title: title, Author: author}})
-    if err != nil {
-		log.Println("Error sending request", err)
-		return
-	}
-    ctx.Redirect("/")
-}
 
-//asks backend to change the fields of a specific book and redirects to index
-func (serverConn *ServerConnection) updateBookAndServeIndex(ctx iris.Context){
-	id, _ := ctx.Params().GetInt("id")
-	title, author := ctx.PostValue("title"), ctx.PostValue("author")
-	err := serverConn.sendRequest(Request{"update", Book{id, title, author}})
-	if err != nil {
-		log.Println("Error sending request", err)
-		return
-	}    
-	ctx.Redirect("/")
-}
-
-//asks backend to delete a book and redirects to index
-func (serverConn *ServerConnection) deleteBookAndServeIndex(ctx iris.Context) {
-	id, err := strconv.Atoi(ctx.PostValue("id"))
-	if err != nil {
-		log.Println("could not convert param to int: ", err)
-	}
-	err = serverConn.sendRequest(Request{"delete", Book{Id: id}})
-	if err != nil {
-		log.Println("Error sending request", err)
-		return
-	}
-    ctx.Redirect("/")
-}
-
-//asks backend for all the books ans serves the index page
-func (serverConn *ServerConnection) getAllAndServeIndex(ctx iris.Context) {
-	err := serverConn.sendRequest(Request{"getall", Book{}})
-	if err != nil {
-		log.Println("Error sending request", err)
-		return
-	}
-	books, ResponseErr := serverConn.recieveBookMap()
-    if ResponseErr == nil {
-		serveIndex(ctx, books)
-    } else {
-    	log.Println("Error in response value: ", ResponseErr)
-    }
-}
 
 //close the previous connection if it's given and dial to the back end
 func (serverConn *ServerConnection) sendPing(conn net.Conn) (net.Conn, error) {
@@ -356,15 +323,85 @@ func (serverConn *ServerConnection) recieveBook() (Book, error) {
 	return book, nil
 }
 
-//load the book data and serve the index page
-func serveIndex(ctx iris.Context, books map[int]*Book){
-	ctx.ViewData("Books", books)
-	ctx.View("index.html")
-}
+
 */
 
 
+//asks backend for all the books ans serves the index page
+func getAllAndServeIndex(ctx iris.Context) {
+	msg := &common.Message{PrimaryType: "client", Request: common.ClientMessage{Cmd: "getall"}}
+	res := sendRequestToLeader(msg)
+	if res.PrimaryType != "ok" {
+		//show error page
+	} else {
+		log.Printf("Got response: %#v\n", *res)
+		allBooks := res.Request.(map[int32]*common.Book)
+		serveIndex(ctx, allBooks)
+	}
+}
 
+func getOneAndServerEdit(id int, ctx iris.Context) {
+	msg := &common.Message{PrimaryType: "client", Request: common.ClientMessage{Cmd: "getone", Book: common.Book{Id: int32(id)}}}
+	res := sendRequestToLeader(msg)
+	if res.PrimaryType != "ok" {
+		//show error page
+	} else {
+		log.Printf("Got response: %#v\n", *res)
+		book := res.Request.(common.Book)
+		ctx.ViewData("Title", book.Title)
+		ctx.ViewData("Author", book.Author)
+		ctx.ViewData("Id", id)
+		ctx.View("edit.html")
+	}
+}
+
+
+//asks backend to add a book and redirects to index
+func addBookAndServeIndex(ctx iris.Context){
+    title, author := ctx.PostValue("title"), ctx.PostValue("author")
+    msg := &common.Message{PrimaryType: "client", Request: common.ClientMessage{Cmd: "new", Book: common.Book{Title: title, Author: author}}}
+	res := sendRequestToLeader(msg)
+	if res.PrimaryType != "ok" {
+		//show error page
+	} else {
+		ctx.Redirect("/")
+	}
+}
+
+
+//asks backend to delete a book and redirects to index
+func deleteBookAndServeIndex(ctx iris.Context) {
+	id, err := strconv.Atoi(ctx.PostValue("id"))
+	if err != nil {
+		log.Println("could not convert param to int: ", err)
+	}
+	msg := &common.Message{PrimaryType: "client", Request: common.ClientMessage{Cmd: "delete", Book: common.Book{Id: int32(id)}}}
+	res := sendRequestToLeader(msg)
+	if res.PrimaryType != "ok" {
+		//show error page
+	} else {
+		ctx.Redirect("/")
+	}
+}
+
+//asks backend to change the fields of a specific book and redirects to index
+func updateBookAndServeIndex(ctx iris.Context){
+	id, _ := ctx.Params().GetInt("id")
+	title, author := ctx.PostValue("title"), ctx.PostValue("author")
+	msg := &common.Message{PrimaryType: "client", Request: common.ClientMessage{Cmd: "update", Book: common.Book{Id: int32(id), Title: title, Author: author}}}
+	res := sendRequestToLeader(msg)
+	if res.PrimaryType != "ok" {
+		//show error page
+	} else {
+		ctx.Redirect("/")
+	}
+}
+
+//load the book data and serve the index page
+func serveIndex(ctx iris.Context, books map[int32]*common.Book){
+	ctx.ViewData("Books", books)
+	ctx.View("index.html")
+}
 
 
 func parseCmdArgs(args []string) (string, []string){
@@ -406,35 +443,38 @@ func parseCmdArgs(args []string) (string, []string){
 func main() {
 	gob.Register(common.RaftMessage{})
 	gob.Register(common.ClientMessage{})
-
+	gob.Register(map[int32]*common.Book{})
+	gob.Register(sync.Map{})
+	idToAddr = make(map[int]string)
+	addrToId = make(map[string]int)
 	//fetch command line argument for custom port and backend address
 	
 
 	args := os.Args[1:]
-	_, backendAddrs := parseCmdArgs(args)
+	port, backendAddrs := parseCmdArgs(args)
 	backends = backendAddrs
 	
 	//get server connection stream
-	reqChan := make(chan *MessageWrapper, 100)
-	go connManager(reqChan)
-	testMsg := MessageWrapper{ResponseChan: make(chan *common.Message), Message: &common.Message{PrimaryType: "client", Request: common.ClientMessage{Cmd: "test"}}}
-	reqChan <- &testMsg
-	res := <- testMsg.ResponseChan
-	log.Printf("res: %#v",res)
-	log.Println("Successfully e stablised a server connection")
+	go connManager()
+	time.Sleep(time.Duration(1 * time.Second))
+	testMsg := &common.Message{PrimaryType: "client", Request: common.ClientMessage{Cmd: "delete", Book: common.Book{Id: 1}}}
+	res := sendRequestToLeader(testMsg)
+	log.Printf("Got response: %#v\n", *res)
 
-	<- testMsg.ResponseChan
+	testMsg = &common.Message{PrimaryType: "client", Request: common.ClientMessage{Cmd: "getall"}}
+	res = sendRequestToLeader(testMsg)
+	log.Printf("Got response: %#v\n", *res)
+	allBooks := res.Request.(map[int32]*common.Book)
+	log.Println(allBooks)
+	
 
-	/*
+	
 	app := iris.New()
 	app.RegisterView(iris.HTML("./templates", ".html").Reload(true))
 
-	//start server health check
-	go serverConn.healthCheck()
-
 	//index page
 	app.Get("/", func(ctx iris.Context) {
-		serverConn.getAllAndServeIndex(ctx)
+		getAllAndServeIndex(ctx)
 	})
 
 	//add page
@@ -445,38 +485,25 @@ func main() {
 	//edit a specific record page
 	app.Get("/edit/{id:int}", func(ctx iris.Context) {
 		id, _ := ctx.Params().GetInt("id")
-		err := serverConn.sendRequest(Request{"getone", Book{Id: id}})
-		if err != nil {
-			log.Println("Error sending request", err)
-			return
-		}
-		book, err := serverConn.recieveBook()
-		if err == nil {
-			ctx.ViewData("Title", book.Title)
-			ctx.ViewData("Author", book.Author)
-			ctx.ViewData("Id", id)
-			ctx.View("edit.html")
-	    } else {
-	    	log.Println("Error in response value: ", err)
-	    }
+		getOneAndServerEdit(id, ctx)
 	})
 
 	//create a new book from new book page form
 	app.Post("/new", func(ctx iris.Context) {
-		serverConn.addBookAndServeIndex(ctx)
+		addBookAndServeIndex(ctx)
 	})
 
 	//remove a book clicked on the index page "delete" button
 	app.Post("/delete", func(ctx iris.Context) {
-		serverConn.deleteBookAndServeIndex(ctx)
+		deleteBookAndServeIndex(ctx)
 	})
 
 	//update the fields of a book based on form from the edit page
 	app.Post("/update/{id:int}", func(ctx iris.Context) {
-	    serverConn.updateBookAndServeIndex(ctx)
+	    updateBookAndServeIndex(ctx)
 	})
 
 	//run the application and listen on determined port
 	app.Run(iris.Addr(port), iris.WithoutServerError(iris.ErrServerClosed))
-	*/
+	
 }

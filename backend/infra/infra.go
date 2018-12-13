@@ -248,7 +248,7 @@ func sendMessageToClient(nodeConn *NodeConnection, message *common.Message) {
 	err := nodeConn.Encoder.Encode(*message)
 	if err != nil {
 		//TODO: if error means the thread is gone, kill it
-		log.Println("Could not write message to client")
+		log.Printf("Could not encode message to client: %#v\n", err)
 		return 
 	}
 	err = nodeConn.writer.Flush()
@@ -291,7 +291,6 @@ func QueueMessageForAll(message *common.Message) {
 func cleanConn(nodeConn *NodeConnection) {
 	getThread(nodeConn.listenThreadId).KillChan <- 1
 	getThread(nodeConn.dispatchTheadId).KillChan <- 1
-	print("Sent kill message")
 	connMapLock.Lock()
 	delete(connMap, nodeConn.Id)
 	connMapLock.Unlock()
@@ -422,6 +421,7 @@ func StartInfra(port string, backends []string, idstr string, defaultMsgChan cha
 	gob.Register([]*common.AppendMessage{})
 	gob.Register(common.ClientMessage{})
 	gob.Register(common.CommitMessage{})
+	gob.Register(map[int32]*common.Book{})
 	connMap = make(map[int]*NodeConnection)
 	threadMap = make(map[int32]*Thread)
 	clusterSize = len(backends) + 1
