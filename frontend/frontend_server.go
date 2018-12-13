@@ -35,7 +35,7 @@ import (
 	//response can potentially time out, but only if the node hit is a candidate, in that case hit a different node
 
 const HEALTHINTERVAL = 5
-const RESPONSETIMEOUT = 2000
+const RESPONSETIMEOUT = 600
 
 type ServerConnection struct {
 	serverAddr string
@@ -332,7 +332,7 @@ func getAllAndServeIndex(ctx iris.Context) {
 	msg := &common.Message{PrimaryType: "client", Request: common.ClientMessage{Cmd: "getall"}}
 	res := sendRequestToLeader(msg)
 	if res.PrimaryType != "ok" {
-		//show error page
+		ctx.View("error.html")
 	} else {
 		log.Printf("Got response: %#v\n", *res)
 		allBooks := res.Request.(map[int32]*common.Book)
@@ -344,7 +344,7 @@ func getOneAndServerEdit(id int, ctx iris.Context) {
 	msg := &common.Message{PrimaryType: "client", Request: common.ClientMessage{Cmd: "getone", Book: common.Book{Id: int32(id)}}}
 	res := sendRequestToLeader(msg)
 	if res.PrimaryType != "ok" {
-		//show error page
+		ctx.View("error.html")
 	} else {
 		log.Printf("Got response: %#v\n", *res)
 		book := res.Request.(common.Book)
@@ -362,7 +362,7 @@ func addBookAndServeIndex(ctx iris.Context){
     msg := &common.Message{PrimaryType: "client", Request: common.ClientMessage{Cmd: "new", Book: common.Book{Title: title, Author: author}}}
 	res := sendRequestToLeader(msg)
 	if res.PrimaryType != "ok" {
-		//show error page
+		ctx.View("error.html")
 	} else {
 		ctx.Redirect("/")
 	}
@@ -378,7 +378,7 @@ func deleteBookAndServeIndex(ctx iris.Context) {
 	msg := &common.Message{PrimaryType: "client", Request: common.ClientMessage{Cmd: "delete", Book: common.Book{Id: int32(id)}}}
 	res := sendRequestToLeader(msg)
 	if res.PrimaryType != "ok" {
-		//show error page
+		ctx.View("error.html")
 	} else {
 		ctx.Redirect("/")
 	}
@@ -391,7 +391,7 @@ func updateBookAndServeIndex(ctx iris.Context){
 	msg := &common.Message{PrimaryType: "client", Request: common.ClientMessage{Cmd: "update", Book: common.Book{Id: int32(id), Title: title, Author: author}}}
 	res := sendRequestToLeader(msg)
 	if res.PrimaryType != "ok" {
-		//show error page
+		ctx.View("error.html")
 	} else {
 		ctx.Redirect("/")
 	}

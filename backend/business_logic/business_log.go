@@ -182,7 +182,9 @@ func Reprocess(msgLog []*common.AppendMessage) {
 	addInitialBooks()
 
 	for _, appndMsg := range(msgLog) {
-		ProcessWrite(&appndMsg.Msg)
+		if !appndMsg.ShouldIgnore {
+			ProcessWrite(&appndMsg.Msg)
+		}
 	}
 
 

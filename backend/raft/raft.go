@@ -75,6 +75,7 @@ wait for oks before sending commit (in which the logNums , start and end are spe
 //Raft Logic 
 const LOGSIZE = 1000
 const RAFTQUEUESIZE = 1000
+const RESPONSETIMEOUT = 400
 
 type Raft struct {
 	//lock should only be locked in this order: Term, State, Log
@@ -184,7 +185,7 @@ func (raft *Raft) leaderTimer () {
 		select {
 		case message = <-raft.PingChan:
 			//check term number
-			log.Printf("Got append with term %d, my term is %d\n", message.Term, raft.Term)
+			//log.Printf("Got append with term %d, my term is %d\n", message.Term, raft.Term)
 			if message.Term >= raft.Term {
 				//got a valid Append entry 
 				//accept this as my leader
@@ -348,13 +349,23 @@ func getTimer(divisor int) *time.Timer {
 	return timer
 }
 
-func (raft *Raft) waitForAppendToGetCommitted(logNum int) {
-	raft.LogNumLock.Lock()
-	for !raft.MsgLog[logNum].IsCommited {
-		raft.LogNumLock.Unlock()
+func (raft *Raft) waitForAppendToGetCommitted(logNum int) bool {
+	timer := time.NewTimer(time.Duration( RESPONSETIMEOUT * time.Millisecond ) )
+	for {
 		raft.LogNumLock.Lock()
+		if raft.MsgLog[logNum].IsCommited {
+			raft.LogNumLock.Unlock()
+			return true
+		}
+		select {
+		case <-timer.C:
+			//mark msg ignored and return false
+			raft.MsgLog[logNum].ShouldIgnore = true
+			raft.LogNumLock.Unlock()
+			return false
+		}
+		raft.LogNumLock.Unlock()
 	}
-	raft.LogNumLock.Unlock()
 }
 
 
@@ -389,7 +400,9 @@ func (raft *Raft) extendLogAndCommit(appendLog []*common.AppendMessage) { //not 
 
 	//process the appends
 	for _, apnd := range(appendLog) {
-		business_logic.ProcessWrite(&apnd.Msg)
+		if !apnd.ShouldIgnore {
+			business_logic.ProcessWrite(&apnd.Msg)
+		}
 	}
 
 	//print the state of the db
@@ -397,11 +410,11 @@ func (raft *Raft) extendLogAndCommit(appendLog []*common.AppendMessage) { //not 
 func (raft *Raft) appendEntryHandler(message *common.Message) {
 	//this function assumes that only the leader (or someone that should be the leader) 
 	//sends append messages
-	log.Printf("got append")
+	//log.Printf("got append")
 	//if got ping of higher term an am leader / in election - kill channels and become follower
 	raftMsg, _ := message.Request.(common.RaftMessage)
 	raft.PingChan <- &raftMsg // notify the leaderTimer that a message is in
-	log.Printf("notified pinger thread")
+	//log.Printf("notified pinger thread")
 	term := raft.getTerm()
 	state := raft.getState()
 	logNum := raft.getLogNum()
@@ -421,7 +434,7 @@ func (raft *Raft) appendEntryHandler(message *common.Message) {
 	} 
 	
 
-	log.Printf("Processing append...")
+	//log.Printf("Processing append...")
 	if raftMsg.Term >= term {
 		if raft.getLeader() != message.NodeId {
 			raft.setLeader(message.NodeId)
@@ -609,20 +622,22 @@ func (raft *Raft) clientMessageHandler(message *common.Message) {
 			//append the message to the log and let the pinger distribute it
 			raft.LogNum += 1
 			logNum := raft.LogNum
-			raft.MsgLog = append(raft.MsgLog, &common.AppendMessage{Term: term, LogNum: raft.LogNum, Msg: clientMessage})		
+			raft.MsgLog = append(raft.MsgLog, &common.AppendMessage{Term: term, LogNum: raft.LogNum, Msg: clientMessage, ShouldIgnore: false})		
 			//spin until log is consistent
 			log.Printf("Appended log %d\n", raft.LogNum)
 			raft.StateLock.Unlock()
 			raft.LogNumLock.Unlock()
 			log.Printf("Waiting for log: %d to get committed\n", logNum)
-			raft.waitForAppendToGetCommitted(logNum)
-
-			log.Printf("Got a quorom...responding to client\n")
-
-			//send response to client
-			message := common.Message{PrimaryType: "ok"}
-			clientMessage.Response <- &message
-			log.Printf("Sent response to client handler in INFRA\n")
+			ok := raft.waitForAppendToGetCommitted(logNum)
+			if ok {
+				log.Printf("Got a quorom...responding to client\n")
+				message := common.Message{PrimaryType: "ok"}
+				clientMessage.Response <- &message
+			} else {
+				log.Printf("Couldn't get a quorom in time...responding to client\n")
+				message := common.Message{PrimaryType: "failure"}
+				clientMessage.Response <- &message
+			}			
 		}
 		
 	} 

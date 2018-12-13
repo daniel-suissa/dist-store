@@ -23,6 +23,7 @@ type AppendMessage struct {
 	LogNum int
 	Msg ClientMessage
 	IsCommited bool
+	ShouldIgnore bool
 }
 
 type CommitMessage struct {
