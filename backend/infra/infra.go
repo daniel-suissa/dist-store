@@ -13,21 +13,28 @@ import (
 	"strconv"
 	"../../common"
 )
-/* important checks
-	- all threads that register themselves should either remove themselves or go forever
 
+/*
+	The purposes of this package are:
+			1. To keep the connection to all nodes alive and to know which nodes are available
+			2. To manage communications between thread on the same connection
+
+	In a few words, if conn A wants to send a message to conn B, it doesnt care to which thread it sends it
+	The thread handling the message on conn B will be determined by conn B's logic and the message type
+	Responses however, get sent directly to the appropriate channel of the thread awaiting that response
 */
-const DIALINTERVAL = 5
-const QUEUESIZE = 10
-const RESPONSESSIZE = 10
 
-var connMap map[int]*NodeConnection
-var connMapLock sync.RWMutex
+const DIALINTERVAL = 5 // seconds between calling each node
+const QUEUESIZE = 10 // how many messages await in the queue of each node at a time
+const RESPONSESSIZE = 10 // how many responses await each thread at a given time
 
-var threadMap map[int32]*Thread
+var connMap map[int]*NodeConnection //connection id -> connection
+var connMapLock sync.RWMutex // protects connMap
+
+var threadMap map[int32]*Thread //tracks the threads by their id
 var threadMapLock sync.RWMutex
 
-var msgChan chan *common.Message // where all messages that are not responses go
+var msgChan chan common.Message // Where all non-response messages go (handled by the raft package)
 
 var id int
 var tid int32
@@ -35,7 +42,7 @@ var tid int32
 var clusterSize int
 
 type NodeConnection struct {
-	nodeAddr string
+	nodeAddr string 
 	reader *bufio.Reader
 	writer *bufio.Writer
 	Queue chan *common.Message
@@ -48,38 +55,36 @@ type NodeConnection struct {
 }
 
 
-
-
 type Thread struct {
 	Tid int32
 	KillChan chan int
 	Responses chan *common.Message
 }
 
-
+//get this node's id
 func GetId() int {
 	return id
 }
 
+//get the number of nodes in this cluster
 func GetClusterSize() int {
 	return clusterSize
 }
-func GetConnMap() map[int]*NodeConnection{
-	connMapLock.RLock()
-	connMapCopy := connMap
-	connMapLock.RUnlock()
-	return connMapCopy
-}
+
 //Thread Communication Infra
+//==========================
+
+//creates a thread and adds it to the map
 func MakeThread() *Thread {
 	thread := Thread{}
 	thread.Tid = atomic.AddInt32(&tid, 1)
 	thread.KillChan = make(chan int, 1)
-	thread.Responses = make(chan *common.Message, RESPONSESSIZE)
+	thread.Responses = make(chan *common.Message, RESPONSESSIZE) //this is how the thread will await responses
 	insertThread(&thread)
 	return &thread
 }
 
+//get a connection from its id
 func GetConn(id int) *NodeConnection {
 	if conn, found := connMap[id]; found {
 		return conn
@@ -87,18 +92,22 @@ func GetConn(id int) *NodeConnection {
 	return nil
 }
 
+
+//insert a thread to the map
 func insertThread(thread *Thread) {
 	threadMapLock.Lock()
 	defer threadMapLock.Unlock()
 	threadMap[thread.Tid] = thread
 }
 
+//removes a thread from the map
 func RemoveThread(id int32) {
 	threadMapLock.Lock()
 	defer threadMapLock.Unlock()
 	delete(threadMap, id)
 }
 
+//get the thread pointer from its id
 func getThread(id int32) *Thread {
 	threadMapLock.RLock()
 	defer threadMapLock.RUnlock()
@@ -110,6 +119,8 @@ func getThread(id int32) *Thread {
 	return t
 }
 
+//this method is called as a goroutine on each node connection
+//Takes messages on the Nodes queue and sends them over the network
 func dispatchMessages(nodeConn *NodeConnection) {
 	log.Printf("starting dispatch thread for node %s\n", nodeConn.nodeAddr)
 	me := MakeThread()
@@ -136,6 +147,11 @@ func dispatchMessages(nodeConn *NodeConnection) {
 	}
 }
 
+//this method is called as a goroutine on each node connection
+//Decodes messages from the TCP connection and sends them to the right thread
+//reponses are sent to the thread with the id specified in the message
+//raft and client messages are sent to the raft handler
+//id messages (used between nodes to tell each other which id they got) are handled here
 func acceptMessages(nodeConn *NodeConnection) {
 	log.Printf("starting accept thread for node %s\n", nodeConn.nodeAddr)
 	//get Message and put in threads channels here
@@ -178,7 +194,13 @@ func acceptMessages(nodeConn *NodeConnection) {
 					} else if message.PrimaryType == "raft" || message.PrimaryType == "client" { //TODO: get rid of client, it should never get here
 						message.NodeAddr = nodeConn.nodeAddr
 						message.NodeId = nodeConn.Id
-						msgChan <- &message
+						if message.SecType == "fullAppend" {
+							log.Printf("INFRA: Got fullAppend")
+						}
+						msgChan <- message
+						if message.SecType == "fullAppend" {
+							log.Printf("INFRA: entry in the channel")
+						}
 					} else if message.PrimaryType == "id" {
 						nodeId, ok := message.Request.(int)
 						if !ok {
@@ -197,12 +219,15 @@ func acceptMessages(nodeConn *NodeConnection) {
 	
 }
 
+//Client Communication
+//====================
+
+//Takes a client message and sends it to the Raft channel, waits for a response,  and returns
+//doesn't handle timeouts, both raft and the frontend know to time out
 func raftClientProcessRequest(message *common.Message) (*common.Message) {
-	
 	if message.SecType == "Id" { //respond to Id requests immediately
 		return &common.Message{PrimaryType: "Id", Request: id}
 	}
-
 	clientMessage, ok := message.Request.(common.ClientMessage)
 	if !ok {
 		log.Printf("Can't make sense of client request, dropping")
@@ -212,13 +237,19 @@ func raftClientProcessRequest(message *common.Message) (*common.Message) {
 	//prepare the message
 	clientMessage.Response = make(chan *common.Message, 1)
 	message.Request = clientMessage
-	msgChan <- message
+	msgChan <- *message
+
+	//wait for the response
 	response := <-clientMessage.Response
 	log.Printf("Sending response: %#v\n", response)
 	return response
 }
 
+//this function is called as a gorouting which runs until the frontend is gone
+//it is called from the createConn function when it discovers that the called is a frontend
+//it is called with the message sent by the front end and responds to all subsequent messages
 func clientMessageHandler(conn net.Conn, nodeConn *NodeConnection,firstMessage *common.Message) {
+	
 	log.Println("Got a new client connection...")
 	//process first message
 	response := raftClientProcessRequest(firstMessage)
@@ -243,6 +274,8 @@ func clientMessageHandler(conn net.Conn, nodeConn *NodeConnection,firstMessage *
 	}
 }
 
+//takes the client connection and the message and handles the sending
+
 func sendMessageToClient(nodeConn *NodeConnection, message *common.Message) {
 	log.Printf("sending message to client: %#v\n", message)
 	err := nodeConn.Encoder.Encode(*message)
@@ -258,6 +291,8 @@ func sendMessageToClient(nodeConn *NodeConnection, message *common.Message) {
 	}
 }
 
+//sends a message over the connection on which its called
+//this is only called by the createConn function and the messages dispatcher
 func (nodeConn *NodeConnection) sendMessage(message *common.Message) (error) {	
 	enc := nodeConn.Encoder
 	err := enc.Encode(*message) //marshall the request
@@ -269,14 +304,21 @@ func (nodeConn *NodeConnection) sendMessage(message *common.Message) (error) {
 	if err != nil {
 		return fmt.Errorf("%#v: Flush failed.", err)
 	}
+
+	if message.SecType == "fullAppend" {
+		log.Printf("Infra: Append sent to node %d\n", nodeConn.Id)
+	}
 	return nil
 }
 
 
+//queues a messages into a connection queue
 func QueueMessage(queue chan<- *common.Message, message *common.Message) {
 	queue <- message
 }
 
+
+//queues a message for all connections
 func QueueMessageForAll(message *common.Message) {
 	connMapLock.RLock()
 	defer connMapLock.RUnlock()
@@ -287,7 +329,9 @@ func QueueMessageForAll(message *common.Message) {
 }
 
 //Connection handlers
+//===================
 
+//deletes a connection from the map and stops its acceptor and dispatcher
 func cleanConn(nodeConn *NodeConnection) {
 	getThread(nodeConn.listenThreadId).KillChan <- 1
 	getThread(nodeConn.dispatchTheadId).KillChan <- 1
@@ -298,9 +342,10 @@ func cleanConn(nodeConn *NodeConnection) {
 }
 
 
+
+//initialize a connection object
 func nodeConnInit(conn net.Conn) bool {
 	//create connection if it doesnt exist
-
 	reader, writer := bufio.NewReader(conn), bufio.NewWriter(conn)
 	nodeConn := createConn(conn, reader, writer)
 	if nodeConn != nil {
@@ -310,6 +355,7 @@ func nodeConnInit(conn net.Conn) bool {
 	return true
 }
 
+//handles the creation of a nodeConnection, setting up its encoder and decoder, and id exchage
 func createConn(conn net.Conn, reader *bufio.Reader, writer *bufio.Writer) *NodeConnection {
 	nodeConn := NodeConnection{}
 	nodeConn.reader = reader
@@ -317,7 +363,8 @@ func createConn(conn net.Conn, reader *bufio.Reader, writer *bufio.Writer) *Node
 	nodeConn.nodeAddr = conn.RemoteAddr().String()
 	nodeConn.Queue = make(chan *common.Message, QUEUESIZE)
 	var err error
-	//send and accept the nodeId
+	
+	//send and accept our nodeIds
 	nodeConn.Encoder = gob.NewEncoder(nodeConn.writer)
 	nodeConn.Decoder = gob.NewDecoder(nodeConn.reader)
 	err = nodeConn.sendMessage(&common.Message{Tid: -1, PrimaryType: "id", Request: id})
@@ -331,7 +378,6 @@ func createConn(conn net.Conn, reader *bufio.Reader, writer *bufio.Writer) *Node
 		log.Printf("error decoding id message: %#v", err)
 		return nil
 	} else if message.PrimaryType == "client" {
-		//TODO: pass the whole nodeConn here
 		go clientMessageHandler(conn, &nodeConn, &message)
 		return nil
 	} else if message.PrimaryType != "id" {
@@ -356,6 +402,8 @@ func createConn(conn net.Conn, reader *bufio.Reader, writer *bufio.Writer) *Node
 	return &nodeConn
 }
 
+
+//diar a node at a given address
 func DialNode(nodeAddr string) {
 	// keep trying to connect forever (serve as ping-ack as well)
 	timer := time.NewTimer(DIALINTERVAL * time.Second)
@@ -371,6 +419,7 @@ func DialNode(nodeAddr string) {
 	}
 }
 
+//open a connection
 func Open(addr string) (net.Conn, error) {
 	log.Println("Dialing " + addr + "..")
 	conn, err := net.Dial("tcp", addr)
@@ -380,6 +429,8 @@ func Open(addr string) (net.Conn, error) {
 	return conn, nil
 }
 
+
+//listen to incoming connections
 func listen(port string) error {
 	listener, err := net.Listen("tcp", port)
 	if err != nil {
@@ -400,22 +451,10 @@ func listen(port string) error {
 	}
 }
 
-func messageThread() {
-	me := MakeThread()
-	types := []string{"A", "B", "C", "D"}
-	var message *common.Message
-	var response *common.Message
-	for _, conn := range connMap {
-		for _,t := range types {
-			message = &common.Message{Tid: me.Tid, PrimaryType: "client", Request: t}
-			QueueMessage(conn.Queue, message)
-			response = <- me.Responses
-			log.Printf("Thread %d got response: %#v\n", me.Tid, *response)
-		}
-	}
-}
-
-func StartInfra(port string, backends []string, idstr string, defaultMsgChan chan *common.Message) {
+//starts the infrastructure for node and communication management.
+//takes this node's id, the port, backends to connect to, and a channel (raft) to send messages to
+func StartInfra(port string, backends []string, idstr string, defaultMsgChan chan common.Message) {
+	//register types to be decoded
 	gob.Register(common.RaftMessage{})
 	gob.Register(common.AppendMessage{})
 	gob.Register([]*common.AppendMessage{})
@@ -423,10 +462,15 @@ func StartInfra(port string, backends []string, idstr string, defaultMsgChan cha
 	gob.Register(common.CommitMessage{})
 	gob.Register(map[int32]*common.Book{})
 	gob.Register(common.Book{})
+	
+
+	//initialize globals
 	connMap = make(map[int]*NodeConnection)
 	threadMap = make(map[int32]*Thread)
 	clusterSize = len(backends) + 1
 	msgChan = defaultMsgChan
+
+	//set up my id
 	if i, err := strconv.Atoi(idstr); err == nil {
     	id = i
 	} else {

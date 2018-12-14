@@ -59,13 +59,21 @@ func InitBookMap() {
 	addInitialBooks()
 }
 
+func getInitialBooks() []*common.Book {
+	var bookList []*common.Book
+	bookList = append(bookList, &common.Book{0, "Harry Potter", "J. K. Rolling"})
+	bookList = append(bookList, &common.Book{1, "Sapiens", "Yuval Noah Harari"})
+	bookList = append(bookList, &common.Book{2, "The Art of Happiness", "The Dalhi Lama"})
+	bookList = append(bookList, &common.Book{3, "Predictibly Unpredictable", "Dan Arieli"})
+	bookList = append(bookList, &common.Book{4, "Blink", "Malcolm Gladwell"})
+	bookList = append(bookList, &common.Book{5, "Principia Mathematica", "Bertrand Russel"})
+	return bookList
+}
+
 func addInitialBooks() {
-	addBook(&common.Book{0, "Harry Potter", "J. K. Rolling"})
-	addBook(&common.Book{1, "Sapiens", "Yuval Noah Harari"})
-	addBook(&common.Book{2, "The Art of Happiness", "The Dalhi Lama"})
-	addBook(&common.Book{3, "Predictibly Unpredictable", "Dan Arieli"})
-	addBook(&common.Book{4, "Blink", "Malcolm Gladwell"})
-	addBook(&common.Book{5, "Principia Mathematica", "Bertrand Russel"})
+	for _, book := range(getInitialBooks()) {
+		addBook(book)
+	}
 }
 
 //sets up the ring sets and the locks for it
@@ -173,11 +181,17 @@ func Reprocess(msgLog []*common.AppendMessage) {
 	for _, lock := range(ringLocks) {
 		lock.Lock()
 	}
+	log.Printf("BUSINESS LOGIC: acquired all locks for resetting\n")
 	//reset the ring
 	ring = ring[:0]
 	for i := 0; i < RINGSIZE; i++ {
 		ring = append(ring,make(map[int32]int))
 	}
+
+	for _, lock := range(ringLocks) {
+		lock.Unlock()
+	}
+	//don't worry about someone processing messages concurrently - raft won'y let it happen
 	idCounter = 0
 	addInitialBooks()
 
@@ -186,11 +200,8 @@ func Reprocess(msgLog []*common.AppendMessage) {
 			ProcessWrite(&appndMsg.Msg)
 		}
 	}
-
-
-	for _, lock := range(ringLocks) {
-		lock.Unlock()
-	}
+	
+	log.Printf("BUSINESS LOGIC: finished reprocessing\n")
 }
 
 func IsRead(clientMsg *common.ClientMessage) bool {

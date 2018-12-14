@@ -1,8 +1,6 @@
 package main
 
 import (
-	//"github.com/kataras/iris"
-	//"strconv"
 	"os"
 	"bufio"
 	"log"
@@ -35,7 +33,7 @@ import (
 	//response can potentially time out, but only if the node hit is a candidate, in that case hit a different node
 
 const HEALTHINTERVAL = 5
-const RESPONSETIMEOUT = 600
+const RESPONSETIMEOUT = 700
 
 type ServerConnection struct {
 	serverAddr string
@@ -45,13 +43,6 @@ type ServerConnection struct {
 	rw *bufio.ReadWriter
 	conn *net.Conn
 }
-
-//temporary for compilation
-type Request struct {
-	Cmd string // getall/getone/add/update/delete
-	Book common.Book
-}
-
 
 var addrToId map[string]int
 var idToAddr map[int]string
@@ -113,7 +104,6 @@ func setLeader(newLeaderId int) {
 func serverConnInit(serverAddr string) (*ServerConnection) {
 	conn, err := Open(serverAddr) //open the connection and get a stream
 	if err != nil {
-		log.Printf("Failed to open connection to %v: %v",serverAddr,err)
 		return nil
 	}
 	rw := bufio.NewReadWriter(bufio.NewReader(*conn), bufio.NewWriter(*conn))
@@ -126,19 +116,24 @@ func serverConnInit(serverAddr string) (*ServerConnection) {
 	return &serverConn
 }
 
-//keep a leaderConn global
-//keep a leadrConn state (true is confirmed, false is not)
-//have a pingack thread - every ping is declares not confirmed, every ack declares confirmed
-//at the beginning ask for all ids 
-
+//send a request to the leader node. Response can be either OK, failure, or a leaderId sent by a follower
 func sendRequestToLeader(message *common.Message) *common.Message {
 	var leaderConn *ServerConnection
 	var res *common.Message
 	for {
 		leaderConn = serverConnInit(getLeader())
 		if leaderConn == nil {
-			log.Printf("Can't connect to leader\n")
-			return nil
+			log.Printf("Can't connect to leader...trying other nodes\n")
+			for _, addr := range(backends) {
+				leaderConn = serverConnInit(addr)
+				if leaderConn != nil {
+					break
+				}
+			}
+			if leaderConn == nil {
+				log.Printf("Can't connect to any node...\n")
+				 	return nil
+			}
 		}
 		err := leaderConn.sendRequest(message)
 		if err != nil {
@@ -146,9 +141,7 @@ func sendRequestToLeader(message *common.Message) *common.Message {
 			return nil
 		}
 		res = leaderConn.acceptRespnse()
-		//TODO: handle case when response is not recieved (timeout)
-		//TODO: handle failure of sendRequest
-		for {
+		for { //backend trying to tell us its id, but we already know it lol silly backend
 			if res.PrimaryType == "id" {
 				log.Println("dropping extraneous id message...")
 				res = leaderConn.acceptRespnse()
@@ -161,22 +154,24 @@ func sendRequestToLeader(message *common.Message) *common.Message {
 			}
 		}
 
-		if res.PrimaryType == "leaderId" {
+		if res.PrimaryType == "leaderId" { //set a new leader if hit a follower
 			leaderId, _ := res.Request.(int)
 			log.Printf("There's a new leader, changing to %s with id %d\n",getAddrFromId(leaderId), leaderId )
 			setLeader(leaderId)
 		} else {
-			break
+			break 
 		}
 	}
 	if leaderConn != nil {
 		(*leaderConn.conn).Close()
 	}
+	log.Printf("Got a repsonse: %#v\n", *res)
 	return res //at this point the message can only be ok or failure
 	
 }
 
 
+//dial a backend address until you get its id
 func setUpBackendId(addr string) {
 	for {
 		serverConn := serverConnInit(addr)
@@ -206,13 +201,6 @@ func connManager() {
 	for _, addr := range(backends) {
 		go setUpBackendId(addr)
 	}
-	
-	//loop forever
-		//take a message from the reqChan
-		//send it to the leader
-		// if getting back LeaderId -> change the leaderConn
-		// if getting back failure - result is failure
-		// if timeout, return to beginning of loop without taking a message out
 }
 
 
@@ -227,8 +215,7 @@ func Open(addr string) (*net.Conn, error) {
 	return &conn, nil
 }
 
-//sends `request` to the backend server at serverAddr
-//returns a stream to the caller (so it can fetch a response)
+//sends `request` to the backend
 func (serverConn *ServerConnection) sendRequest(request *common.Message) (error) {
 	
 	log.Printf("Sending: \n%#v\n", request)
@@ -246,7 +233,7 @@ func (serverConn *ServerConnection) sendRequest(request *common.Message) (error)
 }
 
 
-//recieves and unmarshalls an id->Book map from the backend
+//wait on the connection to have a message coming in. There shouldn't be more than one response for each connection
 func (serverConn *ServerConnection) acceptRespnse() *common.Message {
 	var res *common.Message
 	var err error
@@ -268,64 +255,6 @@ func (serverConn *ServerConnection) acceptRespnse() *common.Message {
 			return &common.Message{PrimaryType: "timeout"}
 	}
 }
-
-
-/*
-
-
-
-//close the previous connection if it's given and dial to the back end
-func (serverConn *ServerConnection) sendPing(conn net.Conn) (net.Conn, error) {
-	if conn != nil {
-		conn.Close()
-	}
-	newConn, err := net.Dial("tcp", serverConn.serverAddr)
-	return newConn, err
-}
-
-//repeatedly ping the server
-func (serverConn *ServerConnection) healthCheck() {
-	conn, err := serverConn.sendPing(nil)
-	timer := time.NewTimer(HEALTHINTERVAL * time.Second)
-	for {
-		if err != nil {
-			log.Printf("Detected failure on %s at %#v\n", serverConn.serverAddr, time.Now().String())
-		}
-		<-timer.C
-		conn, err = serverConn.sendPing(conn)
-		timer = time.NewTimer(HEALTHINTERVAL * time.Second)
-	}
-}
-
-//recieves and unmarshalls an id->Book map from the backend
-func (serverConn *ServerConnection) recieveBookMap() (map[int]*Book, error) {
-	var books map[int]*Book
-	dec := gob.NewDecoder(serverConn.rw)
-	err := dec.Decode(&books)
-	fmt.Println(books)
-	if err != nil {
-		log.Println("Error Decoding: ", err)
-		return nil, fmt.Errorf("%#v: Decoding Failed",err) 
-	}
-	log.Println("Response Recieved! ")
-	return books, nil
-}
-
-//recieves and unmarshalls a single book from the backend
-func (serverConn *ServerConnection) recieveBook() (Book, error) {
-	var book Book
-	dec := gob.NewDecoder(serverConn.rw)
-	err := dec.Decode(&book)
-	if err != nil {
-		return Book{}, fmt.Errorf("%#v: Decoding Failed", err) 
-	}
-	log.Println("Response Recieved!")
-	return book, nil
-}
-
-
-*/
-
 
 //asks backend for all the books ans serves the index page
 func getAllAndServeIndex(ctx iris.Context) {
@@ -456,17 +385,8 @@ func main() {
 	
 	//get server connection stream
 	go connManager()
-	time.Sleep(time.Duration(1 * time.Second))
-	testMsg := &common.Message{PrimaryType: "client", Request: common.ClientMessage{Cmd: "delete", Book: common.Book{Id: 1}}}
-	res := sendRequestToLeader(testMsg)
-	log.Printf("Got response: %#v\n", *res)
 
-	testMsg = &common.Message{PrimaryType: "client", Request: common.ClientMessage{Cmd: "getall"}}
-	res = sendRequestToLeader(testMsg)
-	log.Printf("Got response: %#v\n", *res)
-	allBooks := res.Request.(map[int32]*common.Book)
-	log.Println(allBooks)
-	
+	time.Sleep(time.Duration(1 * time.Second)) // wait a second so the connManager dials all nodes
 
 	
 	app := iris.New()
